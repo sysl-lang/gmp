@@ -1,0 +1,868 @@
+// `Int`: an integer of any size, over GMP's `mpz_t`.
+//
+// **An `Int` is a handle, as a `File` is.** The digits live in one counted box that frees them when
+// the last `Int` naming it goes, so an `Int` is copied, stored and passed like any value. Everything
+// that answers an `Int` — every operator, every method that does not end in `_assign` and does not
+// start with `set_` — builds a fresh one and leaves its operands alone, so code written with
+// operators never sees one value change under another name.
+//
+// **The `_assign` and `set_` methods write in place**, which is what a hot loop wants (no allocation
+// once the value has grown to size) and what GMP's own C API is shaped around. Because the digits are
+// shared, a write through one `Int` is seen through every copy of it, exactly as a write to a `Buf`
+// is; `copy()` makes an independent one first.
+//
+// **Dividing by zero stops the program** with `Int division by zero`, as `/` on a built-in integer
+// traps — GMP itself would raise `SIGFPE`. `checked_div` and `checked_rem` answer `None` instead.
+
+module sh.sysl.gmp
+
+import sh.sysl.gmp.c
+import sysl.text.{cstring, from_utf8_unchecked}
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.raw.ptr_cast
+
+// The one owner of an `mpz_t`. Only ever held as `&Limbs`, inside an `Int`.
+private[gmp] struct Limbs
+    z: c.Mpz
+
+impl Drop for Limbs
+    drop(self)
+        var z = self.z
+        c.mpz_clear(&z)
+
+// Why a string did not parse.
+enum ParseError derives Display
+    // The base is not 0 or 2 to 62.
+    InvalidBase
+    // The text is empty, or holds nothing but white space.
+    Empty
+    // A character is not a digit of the base, or the sign is misplaced.
+    InvalidDigits
+    // A rational's denominator is zero.
+    ZeroDenominator
+
+// What `is_probable_prime` concludes.
+enum Primality derives Display
+    Composite
+    ProbablyPrime
+    Prime
+
+struct Int
+    private inner: &Limbs
+
+    // The `mpz_t` underneath, for a C function this package does not bind. It is valid while this
+    // `Int` (or a copy of it) lives; a C function may write through it.
+    as_mpz(self) -> *c.Mpz = &self.inner.z
+
+    // ## Making one
+
+    // Zero, with no limbs allocated yet.
+    private[gmp] fresh() -> Int
+        val r = Int(Limbs(c.Mpz(0, 0, null)))
+        c.mpz_init(r.as_mpz())
+        r
+    end fresh
+
+    of(v: long) -> Int
+        val r = Int.fresh()
+        c.mpz_set_si(r.as_mpz(), v)
+        r
+    end of
+
+    of(v: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_set_ui(r.as_mpz(), v)
+        r
+    end of
+
+    // Zero, with room for `bits` bits already allocated, so the values assigned into it up to that
+    // size never reallocate.
+    with_capacity(bits: ulong) -> Int
+        val r = Int(Limbs(c.Mpz(0, 0, null)))
+        c.mpz_init2(r.as_mpz(), bits)
+        r
+    end with_capacity
+
+    // The integer part of `x`, truncated toward zero; `None` for a NaN or an infinity.
+    from_real(x: real) -> Option[Int]
+        if x != x || x - x != 0.0 then return None
+
+        val r = Int.fresh()
+        c.mpz_set_d(r.as_mpz(), x)
+        Some(r)
+    end from_real
+
+    // Reads `text` in `base`: 2 to 62, or 0 to read a `0x`, `0b` or `0` prefix as C does. Up to
+    // base 36 letters of either case are digits; above it, upper case is 10 to 35 and lower case 36
+    // to 61. A leading `-` makes it negative, and white space anywhere is ignored, as GMP ignores it.
+    parse(text: string, base: int = 10) -> Result[Int, ParseError]
+        if base != 0 && (base < 2 || base > 62) then return Err(InvalidBase)
+
+        var blank = true
+
+        for b in text.bytes
+            if b == 0 then return Err(InvalidDigits)
+            if !is_space(b) then blank = false
+
+        if blank then return Err(Empty)
+
+        val r = Int.fresh()
+        val s = cstring(text)
+
+        if c.mpz_set_str(r.as_mpz(), s.ptr, base) != 0 then return Err(InvalidDigits)
+
+        Ok(r)
+    end parse
+
+    // The non-negative integer whose magnitude is `bytes`, most significant byte first.
+    from_bytes_be(bytes: []const u8) -> Int
+        val r = Int.fresh()
+        if bytes.len > 0 then c.mpz_import(r.as_mpz(), bytes.len, 1, 1, 1, 0, ptr_cast(as_ptr(bytes)))
+        r
+    end from_bytes_be
+
+    // The non-negative integer whose magnitude is `bytes`, least significant byte first.
+    from_bytes_le(bytes: []const u8) -> Int
+        val r = Int.fresh()
+        if bytes.len > 0 then c.mpz_import(r.as_mpz(), bytes.len, -1, 1, -1, 0, ptr_cast(as_ptr(bytes)))
+        r
+    end from_bytes_le
+
+    // ## Special values
+
+    // `n!`
+    factorial(n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_fac_ui(r.as_mpz(), n)
+        r
+    end factorial
+
+    // `n!!`: n·(n−2)·(n−4)…
+    double_factorial(n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_2fac_ui(r.as_mpz(), n)
+        r
+    end double_factorial
+
+    // n·(n−m)·(n−2m)…
+    multifactorial(n: ulong, m: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_mfac_uiui(r.as_mpz(), n, m)
+        r
+    end multifactorial
+
+    // The product of every prime up to and including `n`.
+    primorial(n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_primorial_ui(r.as_mpz(), n)
+        r
+    end primorial
+
+    // The binomial coefficient (n choose k).
+    binomial(n: ulong, k: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_bin_uiui(r.as_mpz(), n, k)
+        r
+    end binomial
+
+    // `base` to the power `exp`.
+    power(base: ulong, exp: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_ui_pow_ui(r.as_mpz(), base, exp)
+        r
+    end power
+
+    // The `n`th Fibonacci number, F(0) = 0 and F(1) = 1.
+    fibonacci(n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_fib_ui(r.as_mpz(), n)
+        r
+    end fibonacci
+
+    // F(n) and F(n−1), together, for continuing a sequence.
+    fibonacci2(n: ulong) -> (Int, Int)
+        val f = Int.fresh()
+        val g = Int.fresh()
+        c.mpz_fib2_ui(f.as_mpz(), g.as_mpz(), n)
+        (f, g)
+    end fibonacci2
+
+    // The `n`th Lucas number, L(0) = 2 and L(1) = 1.
+    lucas(n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_lucnum_ui(r.as_mpz(), n)
+        r
+    end lucas
+
+    // L(n) and L(n−1).
+    lucas2(n: ulong) -> (Int, Int)
+        val l = Int.fresh()
+        val m = Int.fresh()
+        c.mpz_lucnum2_ui(l.as_mpz(), m.as_mpz(), n)
+        (l, m)
+    end lucas2
+
+    // ## Reading it
+
+    // −1, 0 or 1.
+    sign -> int
+        val s = self.inner.z.size
+        if s < 0 then -1 elif s > 0 then 1 else 0
+    end sign
+
+    is_zero -> bool = self.inner.z.size == 0
+
+    is_negative -> bool = self.inner.z.size < 0
+
+    is_odd -> bool = self.inner.z.size != 0 && (self.inner.z.d[0] & 1) == 1
+
+    is_even -> bool = !self.is_odd
+
+    // The value as a `long`, or `None` where it does not fit.
+    to_long(self) -> Option[long]
+        if c.mpz_fits_slong_p(self.as_mpz()) == 0 then None else Some(c.mpz_get_si(self.as_mpz()))
+
+    // The value as a `ulong`, or `None` where it is negative or does not fit.
+    to_ulong(self) -> Option[ulong]
+        if c.mpz_fits_ulong_p(self.as_mpz()) == 0 then None else Some(c.mpz_get_ui(self.as_mpz()))
+
+    // The value as an `int`, or `None` where it does not fit.
+    to_int(self) -> Option[int]
+        if c.mpz_fits_sint_p(self.as_mpz()) == 0 then None else Some(int(c.mpz_get_si(self.as_mpz())))
+
+    // The low 64 bits of the magnitude, whatever the size — GMP's `mpz_get_ui`.
+    low_ulong(self) -> ulong = c.mpz_get_ui(self.as_mpz())
+
+    // The nearest `real` toward zero. Past `real`'s range the answer is the platform's (an infinity
+    // on IEEE machines).
+    to_real(self) -> real = c.mpz_get_d(self.as_mpz())
+
+    // `(m, e)` with the value equal to m·2^e and 0.5 ≤ |m| < 1 (m truncated), or `(0, 0)` for zero —
+    // a `real` view that does not overflow.
+    to_real_exp(self) -> (real, long)
+        var e: c.Long = 0
+        val m = c.mpz_get_d_2exp(&e, self.as_mpz())
+        (m, e)
+    end to_real_exp
+
+    // The digits in `base`: 2 to 62 in lower case (to 36) and GMP's mixed case above; −2 to −36 in
+    // upper case. Any other base stops the program.
+    to_string_base(self, base: int) -> string
+        val b = self.digits(base)
+        from_utf8_unchecked(b.view())
+    end to_string_base
+
+    private digits(self, base: int) -> Buf[u8]
+        if !((base >= 2 && base <= 62) || (base <= -2 && base >= -36)) then panic(s"Int base $base is not 2 to 62 or -2 to -36")
+
+        val n = c.mpz_sizeinbase(self.as_mpz(), if base < 0 then -base else base) + 2
+        var out: Buf[u8] = buf()
+
+        for _ in 0..<n do out.push(0)
+
+        c.mpz_get_str(as_ptr(out.view()), base, self.as_mpz())
+
+        var len: usize = 0
+        while out[len] != 0 do len += 1
+        out.truncate(len)
+        out
+    end digits
+
+    // The magnitude, most significant byte first, with no leading zeros (empty for zero). The sign is
+    // not in it.
+    to_bytes_be(self) -> Buf[u8] = self.export_bytes(1)
+
+    // The magnitude, least significant byte first.
+    to_bytes_le(self) -> Buf[u8] = self.export_bytes(-1)
+
+    private export_bytes(self, order: i32) -> Buf[u8]
+        var out: Buf[u8] = buf()
+        val n = (c.mpz_sizeinbase(self.as_mpz(), 2) + 7) / 8
+
+        if self.is_zero then return out
+
+        for _ in 0..<n do out.push(0)
+
+        var count: usize = 0
+        c.mpz_export(as_ptr(out.view()), &count, order, 1, order, 0, self.as_mpz())
+        out.truncate(count)
+        out
+    end export_bytes
+
+    // The number of bits in the magnitude: 0 for zero, 1 for ±1, 8 for 255.
+    bit_length(self) -> ulong = if self.is_zero then 0 else c.mpz_sizeinbase(self.as_mpz(), 2)
+
+    // The number of digits the magnitude has in `base` (2 to 62). Exact for a power of two, and
+    // otherwise either exact or one too big — GMP's `mpz_sizeinbase`.
+    size_in_base(self, base: int) -> usize
+        if base < 2 || base > 62 then panic(s"Int base $base is not 2 to 62")
+        c.mpz_sizeinbase(self.as_mpz(), base)
+    end size_in_base
+
+    // How many limbs the magnitude occupies.
+    limb_count(self) -> usize = c.mpz_size(self.as_mpz())
+
+    // Limb `n` of the magnitude, least significant first; zero past the end.
+    limb(self, n: usize) -> ulong = c.mpz_getlimbn(self.as_mpz(), c.Size(n))
+
+    // A second `Int` with the same value and its own digits.
+    copy(self) -> Int
+        val r = Int.fresh()
+        c.mpz_set(r.as_mpz(), self.as_mpz())
+        r
+    end copy
+
+    // ## Comparing
+
+    // Negative, zero or positive as `self` is less than, equal to or greater than `other`.
+    compare(self, other: Int) -> int = sgn(c.mpz_cmp(self.as_mpz(), other.as_mpz()))
+
+    compare(self, other: long) -> int = sgn(c.mpz_cmp_si(self.as_mpz(), other))
+
+    // A NaN compares as GMP leaves it, which is undefined; do not ask.
+    compare(self, other: real) -> int = sgn(c.mpz_cmp_d(self.as_mpz(), other))
+
+    // As `compare`, on the magnitudes.
+    compare_abs(self, other: Int) -> int = sgn(c.mpz_cmpabs(self.as_mpz(), other.as_mpz()))
+
+    compare_abs(self, other: ulong) -> int = sgn(c.mpz_cmpabs_ui(self.as_mpz(), other))
+
+    compare_abs(self, other: real) -> int = sgn(c.mpz_cmpabs_d(self.as_mpz(), other))
+
+    // ## Arithmetic
+
+    abs(self) -> Int
+        val r = Int.fresh()
+        c.mpz_abs(r.as_mpz(), self.as_mpz())
+        r
+    end abs
+
+    pow(self, exp: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_pow_ui(r.as_mpz(), self.as_mpz(), exp)
+        r
+    end pow
+
+    // self^exp mod m, in 0 ≤ r < |m|. A negative `exp` uses the inverse of `self`, so it is `None`
+    // where there is none; `m` of zero is `None` too.
+    pow_mod(self, exp: Int, m: Int) -> Option[Int]
+        if m.is_zero then return None
+        if exp.is_negative && self.invert(m).is_none() then return None
+
+        val r = Int.fresh()
+        c.mpz_powm(r.as_mpz(), self.as_mpz(), exp.as_mpz(), m.as_mpz())
+        Some(r)
+    end pow_mod
+
+    pow_mod(self, exp: ulong, m: Int) -> Option[Int]
+        if m.is_zero then return None
+
+        val r = Int.fresh()
+        c.mpz_powm_ui(r.as_mpz(), self.as_mpz(), exp, m.as_mpz())
+        Some(r)
+    end pow_mod
+
+    // `pow_mod` taking the same time and memory access pattern whatever the exponent's bits are, for
+    // cryptography. GMP requires `exp > 0` and an odd `m`, so anything else is `None`.
+    pow_mod_secure(self, exp: Int, m: Int) -> Option[Int]
+        if exp.sign <= 0 || !m.is_odd then return None
+
+        val r = Int.fresh()
+        c.mpz_powm_sec(r.as_mpz(), self.as_mpz(), exp.as_mpz(), m.as_mpz())
+        Some(r)
+    end pow_mod_secure
+
+    // The integer square root, truncated; `None` for a negative value.
+    sqrt(self) -> Option[Int]
+        if self.is_negative then return None
+
+        val r = Int.fresh()
+        c.mpz_sqrt(r.as_mpz(), self.as_mpz())
+        Some(r)
+    end sqrt
+
+    // `(s, r)` with s the truncated square root and `self = s² + r`; `None` for a negative value.
+    sqrt_rem(self) -> Option[(Int, Int)]
+        if self.is_negative then return None
+
+        val s = Int.fresh()
+        val r = Int.fresh()
+        c.mpz_sqrtrem(s.as_mpz(), r.as_mpz(), self.as_mpz())
+        Some((s, r))
+    end sqrt_rem
+
+    // The `n`th root truncated toward zero; `None` for `n` of zero, or an even root of a negative.
+    root(self, n: ulong) -> Option[Int]
+        if n == 0 || (self.is_negative && n % 2 == 0) then return None
+
+        val r = Int.fresh()
+        c.mpz_root(r.as_mpz(), self.as_mpz(), n)
+        Some(r)
+    end root
+
+    // `(s, r)` with s the truncated `n`th root and `self = sⁿ + r`; `None` where `root` is.
+    root_rem(self, n: ulong) -> Option[(Int, Int)]
+        if n == 0 || (self.is_negative && n % 2 == 0) then return None
+
+        val s = Int.fresh()
+        val r = Int.fresh()
+        c.mpz_rootrem(s.as_mpz(), r.as_mpz(), self.as_mpz(), n)
+        Some((s, r))
+    end root_rem
+
+    // Whether the value is a² for an integer a. 0 and 1 are.
+    is_perfect_square(self) -> bool = c.mpz_perfect_square_p(self.as_mpz()) != 0
+
+    // Whether the value is aᵇ for integers a and b > 1. 0 and 1 are; a negative one only with b odd.
+    is_perfect_power(self) -> bool = c.mpz_perfect_power_p(self.as_mpz()) != 0
+
+    // ## Division
+    //
+    // `/` and `%` truncate toward zero, as they do on a built-in integer. The `floor` family rounds
+    // the quotient toward −∞ (the remainder takes the divisor's sign) and the `ceil` family toward +∞
+    // (the remainder takes the opposite sign). Each stops the program on a zero divisor.
+
+    div_floor(self, d: Int) -> Int = self.div_with(d, &c.mpz_fdiv_q)
+    div_ceil(self, d: Int) -> Int = self.div_with(d, &c.mpz_cdiv_q)
+    rem_floor(self, d: Int) -> Int = self.div_with(d, &c.mpz_fdiv_r)
+    rem_ceil(self, d: Int) -> Int = self.div_with(d, &c.mpz_cdiv_r)
+
+    // The remainder in 0 ≤ r < |d|, whatever the signs: the mathematician's `mod`.
+    modulo(self, d: Int) -> Int = self.div_with(d, &c.mpz_mod)
+
+    // `self / d` where `d` is known to divide `self`, which GMP does much faster. Where it does not,
+    // the answer is meaningless.
+    div_exact(self, d: Int) -> Int = self.div_with(d, &c.mpz_divexact)
+
+    // Quotient and remainder, truncated: `(self / d, self % d)` in one division.
+    div_rem(self, d: Int) -> (Int, Int) = self.div_rem_with(d, &c.mpz_tdiv_qr)
+    div_rem_floor(self, d: Int) -> (Int, Int) = self.div_rem_with(d, &c.mpz_fdiv_qr)
+    div_rem_ceil(self, d: Int) -> (Int, Int) = self.div_rem_with(d, &c.mpz_cdiv_qr)
+
+    // `self / d`, or `None` for a zero divisor.
+    checked_div(self, d: Int) -> Option[Int] = if d.is_zero then None else Some(self / d)
+
+    // `self % d`, or `None` for a zero divisor.
+    checked_rem(self, d: Int) -> Option[Int] = if d.is_zero then None else Some(self % d)
+
+    // `self mod d` for a word-sized `d`, in 0 ≤ r < d, without building an `Int`.
+    mod_ulong(self, d: ulong) -> ulong
+        if d == 0 then div_by_zero()
+        c.mpz_fdiv_ui(self.as_mpz(), d)
+    end mod_ulong
+
+    // `self` divided by 2ⁿ, rounded toward zero (`>>` rounds toward −∞) and toward +∞.
+    shr_trunc(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_tdiv_q_2exp)
+    shr_ceil(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_cdiv_q_2exp)
+
+    // The remainder of a division by 2ⁿ: the low `n` bits as a non-negative number (floor), and the
+    // truncated and ceiling remainders.
+    rem_pow2(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_fdiv_r_2exp)
+    rem_pow2_trunc(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_tdiv_r_2exp)
+    rem_pow2_ceil(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_cdiv_r_2exp)
+
+    // Whether `d` divides `self`. Zero divides only zero.
+    is_divisible_by(self, d: Int) -> bool = c.mpz_divisible_p(self.as_mpz(), d.as_mpz()) != 0
+
+    is_divisible_by(self, d: ulong) -> bool = c.mpz_divisible_ui_p(self.as_mpz(), d) != 0
+
+    is_divisible_by_pow2(self, n: ulong) -> bool = c.mpz_divisible_2exp_p(self.as_mpz(), n) != 0
+
+    // Whether `self ≡ r (mod d)`. With `d` zero, whether they are equal.
+    is_congruent(self, r: Int, d: Int) -> bool = c.mpz_congruent_p(self.as_mpz(), r.as_mpz(), d.as_mpz()) != 0
+
+    is_congruent(self, r: ulong, d: ulong) -> bool = c.mpz_congruent_ui_p(self.as_mpz(), r, d) != 0
+
+    is_congruent_pow2(self, r: Int, n: ulong) -> bool = c.mpz_congruent_2exp_p(self.as_mpz(), r.as_mpz(), n) != 0
+
+    private div_with(self, d: Int, f: *extern(*c.Mpz, *c.Mpz, *c.Mpz) -> unit) -> Int
+        if d.is_zero then div_by_zero()
+
+        val r = Int.fresh()
+        f(r.as_mpz(), self.as_mpz(), d.as_mpz())
+        r
+    end div_with
+
+    private div_rem_with(self, d: Int, f: *extern(*c.Mpz, *c.Mpz, *c.Mpz, *c.Mpz) -> unit) -> (Int, Int)
+        if d.is_zero then div_by_zero()
+
+        val q = Int.fresh()
+        val r = Int.fresh()
+        f(q.as_mpz(), r.as_mpz(), self.as_mpz(), d.as_mpz())
+        (q, r)
+    end div_rem_with
+
+    private shift_with(self, n: ulong, f: *extern(*c.Mpz, *c.Mpz, c.Bitcnt) -> unit) -> Int
+        val r = Int.fresh()
+        f(r.as_mpz(), self.as_mpz(), n)
+        r
+    end shift_with
+
+    // ## Number theory
+
+    // The greatest common divisor, never negative; gcd(0, 0) is 0.
+    gcd(self, other: Int) -> Int
+        val r = Int.fresh()
+        c.mpz_gcd(r.as_mpz(), self.as_mpz(), other.as_mpz())
+        r
+    end gcd
+
+    // `(g, s, t)` with g = gcd(self, other) = self·s + other·t, s and t the smallest such.
+    gcd_ext(self, other: Int) -> (Int, Int, Int)
+        val g = Int.fresh()
+        val s = Int.fresh()
+        val t = Int.fresh()
+        c.mpz_gcdext(g.as_mpz(), s.as_mpz(), t.as_mpz(), self.as_mpz(), other.as_mpz())
+        (g, s, t)
+    end gcd_ext
+
+    // The least common multiple, never negative; 0 if either is 0.
+    lcm(self, other: Int) -> Int
+        val r = Int.fresh()
+        c.mpz_lcm(r.as_mpz(), self.as_mpz(), other.as_mpz())
+        r
+    end lcm
+
+    // The inverse of `self` modulo `m`, in 0 ≤ r < |m|, or `None` where there is none (`self` and
+    // `m` share a factor, or `m` is zero). Every value is its own inverse modulo ±1, as 0.
+    invert(self, m: Int) -> Option[Int]
+        if m.is_zero then return None
+
+        val r = Int.fresh()
+        if c.mpz_invert(r.as_mpz(), self.as_mpz(), m.as_mpz()) == 0 then None else Some(r)
+    end invert
+
+    // The Jacobi symbol (self/b), defined for an odd positive `b` and `None` otherwise.
+    jacobi(self, b: Int) -> Option[int]
+        if b.sign <= 0 || !b.is_odd then return None
+        Some(int(c.mpz_jacobi(self.as_mpz(), b.as_mpz())))
+    end jacobi
+
+    // The Legendre symbol (self/p) for an odd prime `p`: the Jacobi symbol, which it equals there.
+    legendre(self, p: Int) -> Option[int] = self.jacobi(p)
+
+    // The Kronecker symbol (self/b), the extension of Jacobi's to every `b`.
+    kronecker(self, b: Int) -> int = int(c.mpz_jacobi(self.as_mpz(), b.as_mpz()))
+
+    kronecker(self, b: long) -> int = int(c.mpz_kronecker_si(self.as_mpz(), b))
+
+    // GMP's test: trial divisions, a Baillie-PSW test and `reps − 24` Miller-Rabin rounds. `Prime`
+    // only where it is certain; a composite is answered `ProbablyPrime` with probability below
+    // 4^−reps. The manual suggests 15 to 50.
+    is_probable_prime(self, reps: int = 25) -> Primality
+        c.mpz_probab_prime_p(self.as_mpz(), reps) match
+            2 -> Prime
+            1 -> ProbablyPrime
+            _ -> Composite
+    end is_probable_prime
+
+    // The least prime greater than `self` (2 for anything below 2).
+    next_prime(self) -> Int
+        val r = Int.fresh()
+        c.mpz_nextprime(r.as_mpz(), self.as_mpz())
+        r
+    end next_prime
+
+    // The greatest prime less than `self`, or `None` where there is none (`self` ≤ 2).
+    prev_prime(self) -> Option[Int]
+        val r = Int.fresh()
+        if c.mpz_prevprime(r.as_mpz(), self.as_mpz()) == 0 then None else Some(r)
+    end prev_prime
+
+    // `(rest, k)` with self = rest·fᵏ and f not dividing rest; `None` for an f of 0 or ±1, where the
+    // division would never end.
+    remove_factor(self, f: Int) -> Option[(Int, ulong)]
+        if c.mpz_cmpabs_ui(f.as_mpz(), 1) <= 0 then return None
+
+        val r = Int.fresh()
+        val k = c.mpz_remove(r.as_mpz(), self.as_mpz(), f.as_mpz())
+        Some((r, k))
+    end remove_factor
+
+    // (self choose k), for any `self`, negative included.
+    choose(self, k: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_bin_ui(r.as_mpz(), self.as_mpz(), k)
+        r
+    end choose
+
+    // ## Bits
+    //
+    // A negative value is read in two's complement with infinitely many leading ones, as GMP and
+    // every built-in signed integer read it.
+
+    bit(self, n: ulong) -> bool = c.mpz_tstbit(self.as_mpz(), n) != 0
+
+    with_bit_set(self, n: ulong) -> Int = self.bit_with(n, &c.mpz_setbit)
+    with_bit_cleared(self, n: ulong) -> Int = self.bit_with(n, &c.mpz_clrbit)
+    with_bit_flipped(self, n: ulong) -> Int = self.bit_with(n, &c.mpz_combit)
+
+    // How many bits are one; `None` for a negative value, which has infinitely many.
+    count_ones(self) -> Option[ulong] = if self.is_negative then None else Some(c.mpz_popcount(self.as_mpz()))
+
+    // How many bits differ; `None` where the signs differ, which makes it infinite.
+    hamming_distance(self, other: Int) -> Option[ulong]
+        if self.is_negative != other.is_negative then return None
+        Some(c.mpz_hamdist(self.as_mpz(), other.as_mpz()))
+    end hamming_distance
+
+    // The index of the first 0 bit at or above `start`; `None` where there is none (a negative
+    // value's ones go on for ever).
+    find_zero(self, start: ulong = 0) -> Option[ulong]
+        val i = c.mpz_scan0(self.as_mpz(), start)
+        if i == ulong::Max then None else Some(i)
+    end find_zero
+
+    // The index of the first 1 bit at or above `start`; `None` where there is none.
+    find_one(self, start: ulong = 0) -> Option[ulong]
+        val i = c.mpz_scan1(self.as_mpz(), start)
+        if i == ulong::Max then None else Some(i)
+    end find_one
+
+    // How many zero bits are below the lowest one; `None` for zero.
+    trailing_zeros(self) -> Option[ulong] = if self.is_zero then None else self.find_one(0)
+
+    private bit_with(self, n: ulong, f: *extern(*c.Mpz, c.Bitcnt) -> unit) -> Int
+        val r = self.copy()
+        f(r.as_mpz(), n)
+        r
+    end bit_with
+
+    // ## Writing in place
+    //
+    // Each of these changes the value every copy of this `Int` sees, and allocates only when the
+    // result outgrows the room already there.
+
+    assign(self, v: Int) = c.mpz_set(self.as_mpz(), v.as_mpz())
+    assign(self, v: long) = c.mpz_set_si(self.as_mpz(), v)
+
+    // Exchanges the two values (their digits, in O(1)).
+    swap(self, other: Int) = c.mpz_swap(self.as_mpz(), other.as_mpz())
+
+    add_assign(self, v: Int) = c.mpz_add(self.as_mpz(), self.as_mpz(), v.as_mpz())
+    add_assign(self, v: long) = add_long(self.as_mpz(), self.as_mpz(), v)
+    sub_assign(self, v: Int) = c.mpz_sub(self.as_mpz(), self.as_mpz(), v.as_mpz())
+    sub_assign(self, v: long) = add_long_neg(self.as_mpz(), self.as_mpz(), v)
+    mul_assign(self, v: Int) = c.mpz_mul(self.as_mpz(), self.as_mpz(), v.as_mpz())
+    mul_assign(self, v: long) = c.mpz_mul_si(self.as_mpz(), self.as_mpz(), v)
+
+    // Truncating division in place.
+    div_assign(self, d: Int)
+        if d.is_zero then div_by_zero()
+        c.mpz_tdiv_q(self.as_mpz(), self.as_mpz(), d.as_mpz())
+    end div_assign
+
+    div_assign(self, d: long)
+        if d == 0 then div_by_zero()
+        div_long(self.as_mpz(), self.as_mpz(), d)
+    end div_assign
+
+    rem_assign(self, d: Int)
+        if d.is_zero then div_by_zero()
+        c.mpz_tdiv_r(self.as_mpz(), self.as_mpz(), d.as_mpz())
+    end rem_assign
+
+    neg_assign(self) = c.mpz_neg(self.as_mpz(), self.as_mpz())
+
+    shl_assign(self, n: ulong) = c.mpz_mul_2exp(self.as_mpz(), self.as_mpz(), n)
+    shr_assign(self, n: ulong) = c.mpz_fdiv_q_2exp(self.as_mpz(), self.as_mpz(), n)
+
+    // self += a·b
+    add_mul(self, a: Int, b: Int) = c.mpz_addmul(self.as_mpz(), a.as_mpz(), b.as_mpz())
+
+    add_mul(self, a: Int, b: long)
+        if b >= 0 then c.mpz_addmul_ui(self.as_mpz(), a.as_mpz(), magnitude(b))
+        else c.mpz_submul_ui(self.as_mpz(), a.as_mpz(), magnitude(b))
+    end add_mul
+
+    // self −= a·b
+    sub_mul(self, a: Int, b: Int) = c.mpz_submul(self.as_mpz(), a.as_mpz(), b.as_mpz())
+
+    sub_mul(self, a: Int, b: long)
+        if b >= 0 then c.mpz_submul_ui(self.as_mpz(), a.as_mpz(), magnitude(b))
+        else c.mpz_addmul_ui(self.as_mpz(), a.as_mpz(), magnitude(b))
+    end sub_mul
+
+    // self = a + b, a − b, a·b and a / b (truncated), without building a temporary.
+    set_add(self, a: Int, b: Int) = c.mpz_add(self.as_mpz(), a.as_mpz(), b.as_mpz())
+    set_add(self, a: Int, b: long) = add_long(self.as_mpz(), a.as_mpz(), b)
+    set_sub(self, a: Int, b: Int) = c.mpz_sub(self.as_mpz(), a.as_mpz(), b.as_mpz())
+    set_sub(self, a: Int, b: long) = add_long_neg(self.as_mpz(), a.as_mpz(), b)
+    set_mul(self, a: Int, b: Int) = c.mpz_mul(self.as_mpz(), a.as_mpz(), b.as_mpz())
+    set_mul(self, a: Int, b: long) = c.mpz_mul_si(self.as_mpz(), a.as_mpz(), b)
+
+    set_div(self, a: Int, b: Int)
+        if b.is_zero then div_by_zero()
+        c.mpz_tdiv_q(self.as_mpz(), a.as_mpz(), b.as_mpz())
+    end set_div
+
+    set_div(self, a: Int, b: long)
+        if b == 0 then div_by_zero()
+        div_long(self.as_mpz(), a.as_mpz(), b)
+    end set_div
+
+    set_bit(self, n: ulong) = c.mpz_setbit(self.as_mpz(), n)
+    clear_bit(self, n: ulong) = c.mpz_clrbit(self.as_mpz(), n)
+    flip_bit(self, n: ulong) = c.mpz_combit(self.as_mpz(), n)
+end Int
+
+// ## Helpers
+
+private is_space(b: u8) -> bool = b == u8(' ') || (b >= 9 && b <= 13)
+
+private sgn(v: i32) -> int = if v < 0 then -1 elif v > 0 then 1 else 0
+
+private[gmp] div_by_zero() -> never = panic("Int division by zero")
+
+// |v| as an `unsigned long`, `long.min` included.
+private[gmp] magnitude(v: long) -> c.Ulong = if v < 0 then c.Ulong(-(v + 1)) + 1 else c.Ulong(v)
+
+// r = a + v and r = a − v for a signed word, through the unsigned functions GMP has.
+private add_long(r: *c.Mpz, a: *c.Mpz, v: long)
+    if v >= 0 then c.mpz_add_ui(r, a, magnitude(v)) else c.mpz_sub_ui(r, a, magnitude(v))
+
+private add_long_neg(r: *c.Mpz, a: *c.Mpz, v: long)
+    if v >= 0 then c.mpz_sub_ui(r, a, magnitude(v)) else c.mpz_add_ui(r, a, magnitude(v))
+
+// r = a / v truncated, for a non-zero signed word.
+private div_long(r: *c.Mpz, a: *c.Mpz, v: long)
+    c.mpz_tdiv_q_ui(r, a, magnitude(v))
+    if v < 0 then c.mpz_neg(r, r)
+end div_long
+
+private binary(a: Int, b: Int, f: *extern(*c.Mpz, *c.Mpz, *c.Mpz) -> unit) -> Int
+    val r = Int.fresh()
+    f(r.as_mpz(), a.as_mpz(), b.as_mpz())
+    r
+end binary
+
+// ## Operators
+
+impl Add for Int
+    add(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_add)
+
+impl Add[long] for Int
+    add(self, rhs: long) -> Int
+        val r = Int.fresh()
+        add_long(r.as_mpz(), self.as_mpz(), rhs)
+        r
+
+impl Add[Int, Int] for long
+    add(self, rhs: Int) -> Int = rhs + self
+
+impl Sub for Int
+    sub(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_sub)
+
+impl Sub[long] for Int
+    sub(self, rhs: long) -> Int
+        val r = Int.fresh()
+        add_long_neg(r.as_mpz(), self.as_mpz(), rhs)
+        r
+
+impl Sub[Int, Int] for long
+    sub(self, rhs: Int) -> Int
+        val r = rhs - self
+        c.mpz_neg(r.as_mpz(), r.as_mpz())
+        r
+
+impl Mul for Int
+    mul(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_mul)
+
+impl Mul[long] for Int
+    mul(self, rhs: long) -> Int
+        val r = Int.fresh()
+        c.mpz_mul_si(r.as_mpz(), self.as_mpz(), rhs)
+        r
+
+impl Mul[Int, Int] for long
+    mul(self, rhs: Int) -> Int = rhs * self
+
+impl Div for Int
+    div(self, rhs: Int) -> Int
+        if rhs.is_zero then div_by_zero()
+        binary(self, rhs, &c.mpz_tdiv_q)
+
+impl Div[long] for Int
+    div(self, rhs: long) -> Int
+        if rhs == 0 then div_by_zero()
+
+        val r = Int.fresh()
+        div_long(r.as_mpz(), self.as_mpz(), rhs)
+        r
+
+impl Div[Int, Int] for long
+    div(self, rhs: Int) -> Int = Int.of(self) / rhs
+
+impl Rem for Int
+    rem(self, rhs: Int) -> Int
+        if rhs.is_zero then div_by_zero()
+        binary(self, rhs, &c.mpz_tdiv_r)
+
+// The truncated remainder, which takes the dividend's sign, so the divisor's own sign does not
+// matter.
+impl Rem[long] for Int
+    rem(self, rhs: long) -> Int
+        if rhs == 0 then div_by_zero()
+
+        val r = Int.fresh()
+        c.mpz_tdiv_r_ui(r.as_mpz(), self.as_mpz(), magnitude(rhs))
+        r
+
+impl Rem[Int, Int] for long
+    rem(self, rhs: Int) -> Int = Int.of(self) % rhs
+
+impl Neg for Int
+    neg(self) -> Int
+        val r = Int.fresh()
+        c.mpz_neg(r.as_mpz(), self.as_mpz())
+        r
+
+// The one's complement, −self − 1, as `!` is on a built-in signed integer.
+impl Not for Int
+    not(self) -> Int
+        val r = Int.fresh()
+        c.mpz_com(r.as_mpz(), self.as_mpz())
+        r
+
+impl BitAnd for Int
+    bitand(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_and)
+
+impl BitOr for Int
+    bitor(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_ior)
+
+impl BitXor for Int
+    bitxor(self, rhs: Int) -> Int = binary(self, rhs, &c.mpz_xor)
+
+// self·2ⁿ
+impl Shl[ulong] for Int
+    shl(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_mul_2exp)
+
+// self / 2ⁿ rounded toward −∞, the arithmetic shift a built-in signed integer does.
+impl Shr[ulong] for Int
+    shr(self, n: ulong) -> Int = self.shift_with(n, &c.mpz_fdiv_q_2exp)
+
+impl Eq for Int
+    eq(self, rhs: Int) -> bool = c.mpz_cmp(self.as_mpz(), rhs.as_mpz()) == 0
+
+impl Ord for Int
+    lt(self, rhs: Int) -> bool = c.mpz_cmp(self.as_mpz(), rhs.as_mpz()) < 0
+
+// Equal values hash equally: the sign and the limbs in use, nothing past them.
+impl Hash for Int
+    hash(self) -> u64
+        var h = hash_u64(u64.wrap(self.inner.z.size))
+        val n = self.limb_count()
+
+        for i in 0..<n do h = (h *% 0x100000001b3) ^ hash_u64(self.limb(i))
+
+        h
+    end hash
+
+impl Display for Int
+    display(self, out: *Writer, fmt: FormatSpec)
+        val b = self.digits(10)
+        display_digits(b.view(), out, fmt)
+
+impl Debug for Int
+    debug(self, out: *Writer, fmt: FormatSpec) = self.display(out, fmt)

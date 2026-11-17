@@ -1,0 +1,272 @@
+// `Rat`: an exact rational number, over GMP's `mpq_t`.
+//
+// **Always in lowest terms with a positive denominator**, so two equal rationals are equal field for
+// field and `num` and `den` are the canonical pair. It is a handle exactly as `Int` is: every
+// operator and method builds a fresh one.
+//
+// **A zero denominator stops the program** — `Rat.of(1, 0)`, `x / zero` — with `Rat division by
+// zero`, as `Int` does; `Rat.from`, `parse` and `inv` answer `None` or an `Err` instead.
+
+module sh.sysl.gmp
+
+import sh.sysl.gmp.c
+import sysl.text.{cstring, from_utf8_unchecked}
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+
+private[gmp] struct Fraction
+    q: c.Mpq
+
+impl Drop for Fraction
+    drop(self)
+        var q = self.q
+        c.mpq_clear(&q)
+
+struct Rat
+    private inner: &Fraction
+
+    // The `mpq_t` underneath, for a C function this package does not bind. Valid while this `Rat`
+    // lives. A function that writes it must leave it canonical.
+    as_mpq(self) -> *c.Mpq = &self.inner.q
+
+    private fresh() -> Rat
+        val zero = c.Mpz(0, 0, null)
+        val r = Rat(Fraction(c.Mpq(zero, zero)))
+        c.mpq_init(r.as_mpq())
+        r
+    end fresh
+
+    // ## Making one
+
+    // num/den in lowest terms. A zero `den` stops the program.
+    of(num: long, den: long = 1) -> Rat
+        if den == 0 then rat_by_zero()
+
+        val r = Rat.fresh()
+        val n = if den < 0 then -Int.of(num) else Int.of(num)
+        c.mpq_set_num(r.as_mpq(), n.as_mpz())
+        c.mpz_set_ui(&r.inner.q.den, magnitude(den))
+        c.mpq_canonicalize(r.as_mpq())
+        r
+    end of
+
+    // The integer `n`, as a rational.
+    of(n: Int) -> Rat
+        val r = Rat.fresh()
+        c.mpq_set_z(r.as_mpq(), n.as_mpz())
+        r
+    end of
+
+    // num/den in lowest terms, or `None` for a zero `den`.
+    from(num: Int, den: Int) -> Option[Rat]
+        if den.is_zero then return None
+
+        val r = Rat.fresh()
+        c.mpq_set_num(r.as_mpq(), num.as_mpz())
+        c.mpq_set_den(r.as_mpq(), den.as_mpz())
+        c.mpq_canonicalize(r.as_mpq())
+        Some(r)
+    end from
+
+    // The exact value of `x` — every finite `real` is a rational with a power-of-two denominator —
+    // or `None` for a NaN or an infinity.
+    from_real(x: real) -> Option[Rat]
+        if x != x || x - x != 0.0 then return None
+
+        val r = Rat.fresh()
+        c.mpq_set_d(r.as_mpq(), x)
+        Some(r)
+    end from_real
+
+    // Reads `n` or `n/d` in `base` (2 to 62, or 0 for C-style prefixes on each part), as
+    // `Int.parse` reads each part, and puts it in lowest terms. The sign belongs to the numerator: a
+    // `-` after the `/` is refused, where GMP alone would accept it.
+    parse(text: string, base: int = 10) -> Result[Rat, ParseError]
+        if base != 0 && (base < 2 || base > 62) then return Err(InvalidBase)
+
+        var blank = true
+        var slash = false
+
+        for b in text.bytes
+            if b == 0 then return Err(InvalidDigits)
+            if slash && b == u8('-') then return Err(InvalidDigits)
+            if b == u8('/') then slash = true
+            if b != u8(' ') && (b < 9 || b > 13) then blank = false
+
+        if blank then return Err(Empty)
+
+        val r = Rat.fresh()
+        val s = cstring(text)
+
+        if c.mpq_set_str(r.as_mpq(), s.ptr, base) != 0 then return Err(InvalidDigits)
+        if slash && r.inner.q.den.size == 0 then return Err(ZeroDenominator)
+
+        c.mpq_canonicalize(r.as_mpq())
+        Ok(r)
+    end parse
+
+    // ## Reading it
+
+    // The numerator, carrying the sign.
+    num -> Int
+        val n = Int.fresh()
+        c.mpq_get_num(n.as_mpz(), self.as_mpq())
+        n
+    end num
+
+    // The denominator, always positive.
+    den -> Int
+        val d = Int.fresh()
+        c.mpq_get_den(d.as_mpz(), self.as_mpq())
+        d
+    end den
+
+    sign -> int
+        val s = self.inner.q.num.size
+        if s < 0 then -1 elif s > 0 then 1 else 0
+    end sign
+
+    is_zero -> bool = self.inner.q.num.size == 0
+
+    // Whether the denominator is 1.
+    is_integer -> bool = c.mpz_cmp_ui(&self.inner.q.den, 1) == 0
+
+    // The nearest `real` toward zero.
+    to_real(self) -> real = c.mpq_get_d(self.as_mpq())
+
+    // `num/den`, or `num` alone when the denominator is 1, in `base` (as `Int.to_string_base`).
+    to_string_base(self, base: int) -> string
+        val b = self.digits(base)
+        from_utf8_unchecked(b.view())
+    end to_string_base
+
+    private digits(self, base: int) -> Buf[u8]
+        if !((base >= 2 && base <= 62) || (base <= -2 && base >= -36)) then panic(s"Rat base $base is not 2 to 62 or -2 to -36")
+
+        val b = if base < 0 then -base else base
+        val n = c.mpz_sizeinbase(&self.inner.q.num, b) + c.mpz_sizeinbase(&self.inner.q.den, b) + 3
+        var out: Buf[u8] = buf()
+
+        for _ in 0..<n do out.push(0)
+
+        c.mpq_get_str(as_ptr(out.view()), base, self.as_mpq())
+
+        var len: usize = 0
+        while out[len] != 0 do len += 1
+        out.truncate(len)
+        out
+    end digits
+
+    // A second `Rat` with the same value and its own digits.
+    copy(self) -> Rat
+        val r = Rat.fresh()
+        c.mpq_set(r.as_mpq(), self.as_mpq())
+        r
+    end copy
+
+    // ## Arithmetic
+
+    abs(self) -> Rat
+        val r = Rat.fresh()
+        c.mpq_abs(r.as_mpq(), self.as_mpq())
+        r
+    end abs
+
+    // 1/self, or `None` for zero.
+    inv(self) -> Option[Rat]
+        if self.is_zero then return None
+
+        val r = Rat.fresh()
+        c.mpq_inv(r.as_mpq(), self.as_mpq())
+        Some(r)
+    end inv
+
+    // self·2ⁿ and self/2ⁿ.
+    mul_pow2(self, n: ulong) -> Rat
+        val r = Rat.fresh()
+        c.mpq_mul_2exp(r.as_mpq(), self.as_mpq(), n)
+        r
+    end mul_pow2
+
+    div_pow2(self, n: ulong) -> Rat
+        val r = Rat.fresh()
+        c.mpq_div_2exp(r.as_mpq(), self.as_mpq(), n)
+        r
+    end div_pow2
+
+    // The integer below, above, and toward zero.
+    floor(self) -> Int = self.num.div_floor(self.den)
+    ceil(self) -> Int = self.num.div_ceil(self.den)
+    trunc(self) -> Int = self.num / self.den
+
+    // Negative, zero or positive as `self` is less than, equal to or greater than `other`.
+    compare(self, other: Rat) -> int = sgn32(c.mpq_cmp(self.as_mpq(), other.as_mpq()))
+    compare(self, other: Int) -> int = sgn32(c.mpq_cmp_z(self.as_mpq(), other.as_mpz()))
+
+    // Against num/den, with `den` non-zero (zero stops the program).
+    compare(self, num: long, den: ulong) -> int
+        if den == 0 then rat_by_zero()
+        sgn32(c.mpq_cmp_si(self.as_mpq(), num, den))
+    end compare
+end Rat
+
+private sgn32(v: i32) -> int = if v < 0 then -1 elif v > 0 then 1 else 0
+
+private rat_by_zero() -> never = panic("Rat division by zero")
+
+private rat_binary(a: Rat, b: Rat, f: *extern(*c.Mpq, *c.Mpq, *c.Mpq) -> unit) -> Rat
+    val r = Rat.fresh()
+    f(r.as_mpq(), a.as_mpq(), b.as_mpq())
+    r
+end rat_binary
+
+impl Add for Rat
+    add(self, rhs: Rat) -> Rat = rat_binary(self, rhs, &c.mpq_add)
+
+impl Add[long] for Rat
+    add(self, rhs: long) -> Rat = self + Rat.of(rhs)
+
+impl Sub for Rat
+    sub(self, rhs: Rat) -> Rat = rat_binary(self, rhs, &c.mpq_sub)
+
+impl Sub[long] for Rat
+    sub(self, rhs: long) -> Rat = self - Rat.of(rhs)
+
+impl Mul for Rat
+    mul(self, rhs: Rat) -> Rat = rat_binary(self, rhs, &c.mpq_mul)
+
+impl Mul[long] for Rat
+    mul(self, rhs: long) -> Rat = self * Rat.of(rhs)
+
+impl Div for Rat
+    div(self, rhs: Rat) -> Rat
+        if rhs.is_zero then rat_by_zero()
+        rat_binary(self, rhs, &c.mpq_div)
+
+impl Div[long] for Rat
+    div(self, rhs: long) -> Rat
+        if rhs == 0 then rat_by_zero()
+        self / Rat.of(rhs)
+
+impl Neg for Rat
+    neg(self) -> Rat
+        val r = Rat.fresh()
+        c.mpq_neg(r.as_mpq(), self.as_mpq())
+        r
+
+impl Eq for Rat
+    eq(self, rhs: Rat) -> bool = c.mpq_equal(self.as_mpq(), rhs.as_mpq()) != 0
+
+impl Ord for Rat
+    lt(self, rhs: Rat) -> bool = c.mpq_cmp(self.as_mpq(), rhs.as_mpq()) < 0
+
+impl Hash for Rat
+    hash(self) -> u64 = (self.num.hash() *% 0x100000001b3) ^ self.den.hash()
+
+impl Display for Rat
+    display(self, out: *Writer, fmt: FormatSpec)
+        val b = self.digits(10)
+        display_pad(b.view(), out, fmt)
+
+impl Debug for Rat
+    debug(self, out: *Writer, fmt: FormatSpec) = self.display(out, fmt)

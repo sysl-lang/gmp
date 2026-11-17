@@ -1,0 +1,165 @@
+module sh.sysl.gmp.c
+@tests
+
+import sysl.slices.as_ptr
+
+// **Every struct declared in `c.sysl` is checked against the C one**, and so is every field the layer
+// above reads by name (`size` for the sign, `d` for parity, a rational's `num` and `den`). Nothing
+// else relates sysl's layout to GMP's, so a GMP that moves a field fails here first.
+
+@test("the structs are the size C says")
+struct_sizes()
+    assert_eq(sizeof(Mpz), MPZ_SIZE)
+    assert_eq(sizeof(Mpq), MPQ_SIZE)
+    assert_eq(sizeof(RandState), RANDSTATE_SIZE)
+    assert_eq(sizeof(Limb), LIMB_SIZE)
+
+@test("the fields are where C puts them")
+field_offsets()
+    assert_eq(offsetof(Mpz, alloc), MPZ_OFF_ALLOC)
+    assert_eq(offsetof(Mpz, size), MPZ_OFF_SIZE)
+    assert_eq(offsetof(Mpz, d), MPZ_OFF_D)
+    assert_eq(offsetof(Mpq, num), MPQ_OFF_NUM)
+    assert_eq(offsetof(Mpq, den), MPQ_OFF_DEN)
+    assert_eq(offsetof(RandState, seed), RANDSTATE_OFF_SEED)
+    assert_eq(offsetof(RandState, alg), RANDSTATE_OFF_ALG)
+    assert_eq(offsetof(RandState, algdata), RANDSTATE_OFF_ALGDATA)
+
+@test("the exported variables agree with the header's macros")
+variables()
+    assert_eq(bits_per_limb, LIMB_BITS)
+    assert_eq(NAIL_BITS, 0)
+    assert_eq(version[0], u8('0') + u8(VERSION_MAJOR))
+
+@test("init, set_str, get_str and clear by hand, the C way")
+raw_round_trip()
+    var z = Mpz(0, 0, null)
+
+    mpz_init(&z)
+    assert_eq(mpz_set_str(&z, as_ptr("-123456789012345678901234567890".bytes), 10), 0)
+    assert_eq(z.size < 0, true)
+
+    var out: [40]u8
+
+    mpz_get_str(&out[0], 10, &z)
+    assert_eq(out[0], u8('-'))
+    assert_eq(out[30], u8('0'))
+    assert_eq(out[31], 0)
+    assert_eq(mpz_set_str(&z, as_ptr("12x".bytes), 10), -1)
+    mpz_clear(&z)
+
+@test("a rational's numerator and denominator are the two mpz fields")
+rational_fields()
+    var q = Mpq(Mpz(0, 0, null), Mpz(0, 0, null))
+
+    mpq_init(&q)
+    mpq_set_si(&q, -6, 4)
+    mpq_canonicalize(&q)
+    assert_eq(mpz_get_si(&q.num), -3)
+    assert_eq(mpz_get_si(&q.den), 2)
+    assert_eq(mpq_cmp_si(&q, -3, 2), 0)
+    mpq_clear(&q)
+
+extern "tmpfile" tmpfile() -> *File
+extern "rewind" rewind(f: *File)
+extern "fclose" fclose(f: *File) -> i32
+
+@test("a value written to a stream reads back, raw and as text")
+stream_round_trip()
+    val f = tmpfile()
+    var a = Mpz(0, 0, null)
+    var b = Mpz(0, 0, null)
+    var t = Mpz(0, 0, null)
+
+    mpz_init(&a)
+    mpz_init(&b)
+    mpz_init(&t)
+    mpz_ui_pow_ui(&a, 3, 200)
+    mpz_neg(&a, &a)
+
+    assert(mpz_out_raw(f, &a) > 0, "raw written")
+    assert(mpz_out_str(f, 16, &a) > 0, "text written")
+    rewind(f)
+    assert(mpz_inp_raw(&b, f) > 0, "raw read")
+    assert(mpz_inp_str(&t, f, 16) > 0, "text read")
+    assert_eq(mpz_cmp(&a, &b), 0)
+    assert_eq(mpz_cmp(&a, &t), 0)
+
+    mpz_clear(&a)
+    mpz_clear(&b)
+    mpz_clear(&t)
+    fclose(f)
+
+@test("a rational written as text reads back")
+rational_stream()
+    val f = tmpfile()
+    var q = Mpq(Mpz(0, 0, null), Mpz(0, 0, null))
+    var r = Mpq(Mpz(0, 0, null), Mpz(0, 0, null))
+
+    mpq_init(&q)
+    mpq_init(&r)
+    mpq_set_si(&q, -22, 7)
+    assert(mpq_out_str(f, 10, &q) > 0, "written")
+    rewind(f)
+    assert(mpq_inp_str(&r, f, 10) > 0, "read")
+    assert_eq(mpq_equal(&q, &r), 1)
+    mpq_clear(&q)
+    mpq_clear(&r)
+    fclose(f)
+
+@test("limbs written by hand become the value")
+limbs_by_hand()
+    var z = Mpz(0, 0, null)
+
+    mpz_init(&z)
+
+    val p = mpz_limbs_write(&z, 2)
+
+    p[0] = 5
+    p[1] = 1
+    mpz_limbs_finish(&z, 2)
+    assert_eq(mpz_size(&z), 2)
+    assert_eq(mpz_getlimbn(&z, 0), 5)
+    assert_eq(mpz_getlimbn(&z, 1), 1)
+    assert_eq(mpz_limbs_read(&z)[1], 1)
+    assert_eq(mpz_sizeinbase(&z, 2), 65)
+
+    val m = mpz_limbs_modify(&z, 2)
+
+    m[1] = 0
+    mpz_limbs_finish(&z, 2)
+    assert_eq(mpz_size(&z), 1)
+
+    var view = Mpz(0, 0, null)
+    var limbs: [2]Limb = [7, 0]
+    val v = mpz_roinit_n(&view, &limbs[0], 1)
+
+    assert_eq(mpz_get_ui(v), 7)
+    mpz_clear(&z)
+
+@test("the allocator hooks are GMP's own until replaced")
+memory_functions()
+    var a: *extern(usize) -> *u8 = null
+    var r: *extern(*u8, usize, usize) -> *u8 = null
+    var f: *extern(*u8, usize) -> unit = null
+
+    get_memory_functions(&a, &r, &f)
+    assert(a != null && r != null && f != null, "all three")
+    set_memory_functions(a, r, f)
+
+@test("the word-sized helpers")
+word_helpers()
+    var z = Mpz(0, 0, null)
+
+    mpz_init_set_si(&z, -17)
+    assert_eq(mpz_tdiv_ui(&z, 5), 2)
+    assert_eq(mpz_fdiv_ui(&z, 5), 3)
+    assert_eq(mpz_cdiv_ui(&z, 5), 2)
+    assert_eq(mpz_cmpabs_ui(&z, 17), 0)
+    assert_eq(mpz_fits_sshort_p(&z), 1)
+    assert_eq(mpz_fits_ushort_p(&z), 0)
+    assert_eq(mpz_fits_uint_p(&z), 0)
+    assert_eq(mpz_kronecker_ui(&z, 3), 1)
+    assert_eq(mpz_si_kronecker(2, &z), 1)
+    assert_eq(mpz_ui_kronecker(2, &z), 1)
+    mpz_clear(&z)

@@ -1,0 +1,109 @@
+// `Random`: GMP's random state, for drawing `Int`s of any size.
+//
+// A `&Random`, freed when the last reference goes. **Not for cryptography**: GMP's generators are
+// the Mersenne Twister and linear congruential ones, chosen for speed and reproducibility — the same
+// seed gives the same sequence on every machine, which is what a test or a simulation wants.
+
+module sh.sysl.gmp
+
+import sh.sysl.gmp.c
+
+struct Random
+    private state: c.RandState
+
+    // The `gmp_randstate_t` underneath, for a C function this package does not bind.
+    as_randstate(*self) -> *c.RandState = &self.state
+
+    // GMP's default generator (the Mersenne Twister), seeded with `seed`.
+    new(seed: ulong = 0) -> &Random
+        val r = Random(blank_state())
+        c.gmp_randinit_default(r.as_randstate())
+        c.gmp_randseed_ui(r.as_randstate(), seed)
+        r
+    end new
+
+    // The Mersenne Twister, by name: `new` is the same generator today.
+    mersenne(seed: ulong = 0) -> &Random
+        val r = Random(blank_state())
+        c.gmp_randinit_mt(r.as_randstate())
+        c.gmp_randseed_ui(r.as_randstate(), seed)
+        r
+    end mersenne
+
+    // A linear congruential generator X ← (a·X + c) mod 2^m2exp, of which each draw uses the high
+    // half of the bits.
+    congruential(a: Int, c_: ulong, m2exp: ulong, seed: ulong = 0) -> &Random
+        val r = Random(blank_state())
+        c.gmp_randinit_lc_2exp(r.as_randstate(), a.as_mpz(), c_, m2exp)
+        c.gmp_randseed_ui(r.as_randstate(), seed)
+        r
+    end congruential
+
+    // A linear congruential generator from GMP's table, giving at least `size` bits of quality per
+    // draw; `None` past the table (128 bits).
+    congruential_of_size(size: ulong, seed: ulong = 0) -> Option[&Random]
+        var s = blank_state()
+
+        if c.gmp_randinit_lc_2exp_size(&s, size) == 0 then return None
+
+        val r = Random(s)
+        c.gmp_randseed_ui(r.as_randstate(), seed)
+        Some(r)
+    end congruential_of_size
+
+    // An independent generator in the same state, which will draw the same sequence from here.
+    copy(*self) -> &Random
+        val r = Random(blank_state())
+        c.gmp_randinit_set(r.as_randstate(), &self.state)
+        r
+    end copy
+
+    // Starts the sequence again from `seed`.
+    reseed(*self, seed: ulong) = c.gmp_randseed_ui(&self.state, seed)
+
+    // Starts the sequence again from a seed of any size.
+    reseed(*self, seed: Int) = c.gmp_randseed(&self.state, seed.as_mpz())
+
+    // A uniform integer in 0 ≤ r < 2ⁿ.
+    bits(*self, n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_urandomb(r.as_mpz(), &self.state, n)
+        r
+    end bits
+
+    // A uniform integer in 0 ≤ r < n. A bound that is not positive stops the program.
+    below(*self, n: Int) -> Int
+        if n.sign <= 0 then panic("Random.below needs a positive bound")
+
+        val r = Int.fresh()
+        c.mpz_urandomm(r.as_mpz(), &self.state, n.as_mpz())
+        r
+    end below
+
+    // An integer below 2ⁿ with long runs of ones and zeros in its binary form, for testing code
+    // against the values that break carry handling. Its top bit is always set.
+    sparse_bits(*self, n: ulong) -> Int
+        val r = Int.fresh()
+        c.mpz_rrandomb(r.as_mpz(), &self.state, n)
+        r
+    end sparse_bits
+
+    // A uniform word of `n` ≤ 64 bits; more stops the program.
+    word_bits(*self, n: ulong) -> ulong
+        if n > 64 then panic("Random.word_bits takes at most 64 bits")
+        c.gmp_urandomb_ui(&self.state, n)
+    end word_bits
+
+    // A uniform word in 0 ≤ r < n. Zero stops the program.
+    word_below(*self, n: ulong) -> ulong
+        if n == 0 then panic("Random.word_below needs a positive bound")
+        c.gmp_urandomm_ui(&self.state, n)
+    end word_below
+end Random
+
+impl Drop for Random
+    drop(self)
+        var s = self.state
+        c.gmp_randclear(&s)
+
+private blank_state() -> c.RandState = c.RandState(c.Mpz(0, 0, null), 0, null)

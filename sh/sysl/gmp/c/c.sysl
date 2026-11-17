@@ -1,0 +1,382 @@
+// GMP as C declares it: the integer (`mpz`) and rational (`mpq`) layers of `gmp.h`, the random
+// state, the allocator hooks, and the three variables the library exports.
+//
+// **Nothing here is meant to be called by a program.** A GMP value is a struct the caller allocates
+// and must `init` before use and `clear` after, an error is a `-1` or a `SIGFPE`, and a string is a
+// buffer that has to be sized first. `sh.sysl.gmp` turns that into an `Int`, a `Rat` and a `Random`
+// that free themselves, and is what an application imports.
+//
+// **Every public name in `gmp.h` is a macro.** `mpz_add` is `#define`d to `__gmpz_add`, so each
+// `extern` below names the real exported symbol and keeps the documented name. There is no C in this
+// package: the handful of function-like macros (`mpz_sgn`, `mpz_odd_p`, `mpz_even_p`, `mpq_sgn`,
+// `mpq_numref`, `mpq_denref`) only read fields of the structs below, and the layer above reads them
+// the same way. `mpz_cmp_si`/`_ui` and `mpq_cmp_si`/`_ui` are macros over real functions too
+// (`__gmpz_cmp_si` and the rest), which are bound here.
+//
+// **The structs are declared field for field** and `tests.sysl` checks every `sizeof` and `offsetof`
+// against the header's own, so a GMP that changes its layout fails a test rather than a read.
+//
+// **Absent on purpose** (the README says the same):
+//
+// - the `mpf` floating-point layer (68 functions) — MPFR supersedes it, and GMP's own manual
+//   recommends MPFR for new code; it is a separate binding if wanted;
+// - the `mpn` limb-array layer (the low-level kernels the others are built on) — it works on raw
+//   limb arrays a caller sizes by hand, which is what `mpz` exists to hide;
+// - the `gmp_printf` / `gmp_scanf` families — variadic formatting over C's `printf` grammar, where
+//   `Display` and `parse` already render and read every value;
+// - the variadic `mpz_inits`/`mpz_clears`/`mpq_inits`/`mpq_clears` — conveniences over `init` and
+//   `clear`, which are bound;
+// - what the manual lists as obsolete or internal: `mpz_random`, `mpz_random2`, `mpz_array_init`,
+//   `_mpz_realloc`, `gmp_randinit` (variadic), `mpz_millerrabin`, and the `__gmpz_*` helpers no
+//   macro names (`mpz_aorsmul_1`, `mpz_divexact_gcd`, `mpz_lucas_mod`, `mpz_oddfac_1`,
+//   `mpz_prodlimbs`, `mpz_stronglucas`, `mpz_inp_str_nowhite`, `mpz_n_pow_ui`, and
+//   `__gmpz_legendre`, which the header never names: its `mpz_legendre` is `mpz_jacobi`);
+// - `mpz_set_f` and `mpq_set_f`, which take an `mpf`.
+
+module sh.sysl.gmp.c
+
+@link("gmp")
+
+@include("stddef.h")
+@include("stdio.h")
+@include("gmp.h")
+
+// ## Types C measures
+
+c type
+    // `unsigned long` and `long`: the `_ui` and `_si` families take them, and their width is the
+    // platform's (64 bits on every LP64 machine, 32 on Windows).
+    Ulong = "unsigned long"
+    Long = "long"
+    Limb = "mp_limb_t"
+    Size = "mp_size_t"
+    Bitcnt = "mp_bitcnt_t"
+
+// ## Constants
+
+c const
+    VERSION_MAJOR: i32 = "__GNU_MP_VERSION"
+    VERSION_MINOR: i32 = "__GNU_MP_VERSION_MINOR"
+    VERSION_PATCHLEVEL: i32 = "__GNU_MP_VERSION_PATCHLEVEL"
+    LIMB_BITS: i32 = "GMP_LIMB_BITS"
+    NAIL_BITS: i32 = "GMP_NAIL_BITS"
+
+    // `gmp_errno` bits, set by the random functions and the allocator.
+    ERROR_NONE: i32 = "GMP_ERROR_NONE"
+    ERROR_UNSUPPORTED_ARGUMENT: i32 = "GMP_ERROR_UNSUPPORTED_ARGUMENT"
+    ERROR_DIVISION_BY_ZERO: i32 = "GMP_ERROR_DIVISION_BY_ZERO"
+    ERROR_SQRT_OF_NEGATIVE: i32 = "GMP_ERROR_SQRT_OF_NEGATIVE"
+    ERROR_INVALID_ARGUMENT: i32 = "GMP_ERROR_INVALID_ARGUMENT"
+
+    RAND_ALG_DEFAULT: i32 = "GMP_RAND_ALG_DEFAULT"
+
+    // The layouts `tests.sysl` holds the structs below to.
+    MPZ_SIZE: usize = "sizeof(__mpz_struct)"
+    MPZ_OFF_ALLOC: usize = "offsetof(__mpz_struct, _mp_alloc)"
+    MPZ_OFF_SIZE: usize = "offsetof(__mpz_struct, _mp_size)"
+    MPZ_OFF_D: usize = "offsetof(__mpz_struct, _mp_d)"
+    MPQ_SIZE: usize = "sizeof(__mpq_struct)"
+    MPQ_OFF_NUM: usize = "offsetof(__mpq_struct, _mp_num)"
+    MPQ_OFF_DEN: usize = "offsetof(__mpq_struct, _mp_den)"
+    RANDSTATE_SIZE: usize = "sizeof(__gmp_randstate_struct)"
+    RANDSTATE_OFF_SEED: usize = "offsetof(__gmp_randstate_struct, _mp_seed)"
+    RANDSTATE_OFF_ALG: usize = "offsetof(__gmp_randstate_struct, _mp_alg)"
+    RANDSTATE_OFF_ALGDATA: usize = "offsetof(__gmp_randstate_struct, _mp_algdata)"
+    LIMB_SIZE: usize = "sizeof(mp_limb_t)"
+
+// ## Structs
+
+// `__mpz_struct`: `alloc` limbs at `d`, of which `|size|` are in use; the sign of `size` is the
+// sign of the number, and zero is `size == 0`.
+struct Mpz
+    alloc: i32
+    size: i32
+    d: *Limb
+
+// `__mpq_struct`: a numerator and a denominator, kept in lowest terms with `den > 0` by every
+// function but `set_num`/`set_den`/`set_str`, after which `mpq_canonicalize` restores it.
+struct Mpq
+    num: Mpz
+    den: Mpz
+
+// `__gmp_randstate_struct`. `algdata` is a one-armed union of a `void *`.
+struct RandState
+    seed: Mpz
+    alg: i32
+    algdata: *u8
+
+// `FILE`, for the four functions that read and write a stream.
+opaque struct File
+
+// ## Variables
+
+extern "__gmp_version" version: *u8
+extern "__gmp_bits_per_limb" bits_per_limb: i32
+extern "__gmp_errno" errno: i32
+
+// ## Memory
+
+extern "__gmp_set_memory_functions" set_memory_functions(
+    alloc: *extern(usize) -> *u8,
+    realloc: *extern(*u8, usize, usize) -> *u8,
+    free: *extern(*u8, usize) -> unit)
+
+extern "__gmp_get_memory_functions" get_memory_functions(
+    alloc: **extern(usize) -> *u8,
+    realloc: **extern(*u8, usize, usize) -> *u8,
+    free: **extern(*u8, usize) -> unit)
+
+// ## Integers: initialization and assignment
+
+extern "__gmpz_init" mpz_init(x: *Mpz)
+extern "__gmpz_init2" mpz_init2(x: *Mpz, n: Bitcnt)
+extern "__gmpz_clear" mpz_clear(x: *Mpz)
+extern "__gmpz_realloc2" mpz_realloc2(x: *Mpz, n: Bitcnt)
+
+extern "__gmpz_set" mpz_set(rop: *Mpz, op: *Mpz)
+extern "__gmpz_set_ui" mpz_set_ui(rop: *Mpz, op: Ulong)
+extern "__gmpz_set_si" mpz_set_si(rop: *Mpz, op: Long)
+extern "__gmpz_set_d" mpz_set_d(rop: *Mpz, op: f64)
+extern "__gmpz_set_q" mpz_set_q(rop: *Mpz, op: *Mpq)
+extern "__gmpz_set_str" mpz_set_str(rop: *Mpz, s: *u8, base: i32) -> i32
+extern "__gmpz_swap" mpz_swap(a: *Mpz, b: *Mpz)
+
+extern "__gmpz_init_set" mpz_init_set(rop: *Mpz, op: *Mpz)
+extern "__gmpz_init_set_ui" mpz_init_set_ui(rop: *Mpz, op: Ulong)
+extern "__gmpz_init_set_si" mpz_init_set_si(rop: *Mpz, op: Long)
+extern "__gmpz_init_set_d" mpz_init_set_d(rop: *Mpz, op: f64)
+extern "__gmpz_init_set_str" mpz_init_set_str(rop: *Mpz, s: *u8, base: i32) -> i32
+
+// ## Integers: conversion
+
+extern "__gmpz_get_ui" mpz_get_ui(op: *Mpz) -> Ulong
+extern "__gmpz_get_si" mpz_get_si(op: *Mpz) -> Long
+extern "__gmpz_get_d" mpz_get_d(op: *Mpz) -> f64
+extern "__gmpz_get_d_2exp" mpz_get_d_2exp(exp: *Long, op: *Mpz) -> f64
+extern "__gmpz_get_str" mpz_get_str(s: *u8, base: i32, op: *Mpz) -> *u8
+
+// ## Integers: arithmetic
+
+extern "__gmpz_add" mpz_add(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_add_ui" mpz_add_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_sub" mpz_sub(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_sub_ui" mpz_sub_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_ui_sub" mpz_ui_sub(rop: *Mpz, a: Ulong, b: *Mpz)
+extern "__gmpz_mul" mpz_mul(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_mul_si" mpz_mul_si(rop: *Mpz, a: *Mpz, b: Long)
+extern "__gmpz_mul_ui" mpz_mul_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_addmul" mpz_addmul(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_addmul_ui" mpz_addmul_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_submul" mpz_submul(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_submul_ui" mpz_submul_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_mul_2exp" mpz_mul_2exp(rop: *Mpz, a: *Mpz, n: Bitcnt)
+extern "__gmpz_neg" mpz_neg(rop: *Mpz, a: *Mpz)
+extern "__gmpz_abs" mpz_abs(rop: *Mpz, a: *Mpz)
+
+// ## Integers: division
+//
+// `c` rounds the quotient toward +infinity, `f` toward -infinity, `t` toward zero. Each divides by
+// zero with `SIGFPE`, which is why the layer above checks first.
+
+extern "__gmpz_cdiv_q" mpz_cdiv_q(q: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_cdiv_r" mpz_cdiv_r(r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_cdiv_qr" mpz_cdiv_qr(q: *Mpz, r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_cdiv_q_ui" mpz_cdiv_q_ui(q: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_cdiv_r_ui" mpz_cdiv_r_ui(r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_cdiv_qr_ui" mpz_cdiv_qr_ui(q: *Mpz, r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_cdiv_ui" mpz_cdiv_ui(n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_cdiv_q_2exp" mpz_cdiv_q_2exp(q: *Mpz, n: *Mpz, b: Bitcnt)
+extern "__gmpz_cdiv_r_2exp" mpz_cdiv_r_2exp(r: *Mpz, n: *Mpz, b: Bitcnt)
+
+extern "__gmpz_fdiv_q" mpz_fdiv_q(q: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_fdiv_r" mpz_fdiv_r(r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_fdiv_qr" mpz_fdiv_qr(q: *Mpz, r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_fdiv_q_ui" mpz_fdiv_q_ui(q: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_fdiv_r_ui" mpz_fdiv_r_ui(r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_fdiv_qr_ui" mpz_fdiv_qr_ui(q: *Mpz, r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_fdiv_ui" mpz_fdiv_ui(n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_fdiv_q_2exp" mpz_fdiv_q_2exp(q: *Mpz, n: *Mpz, b: Bitcnt)
+extern "__gmpz_fdiv_r_2exp" mpz_fdiv_r_2exp(r: *Mpz, n: *Mpz, b: Bitcnt)
+
+extern "__gmpz_tdiv_q" mpz_tdiv_q(q: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_tdiv_r" mpz_tdiv_r(r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_tdiv_qr" mpz_tdiv_qr(q: *Mpz, r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_tdiv_q_ui" mpz_tdiv_q_ui(q: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_tdiv_r_ui" mpz_tdiv_r_ui(r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_tdiv_qr_ui" mpz_tdiv_qr_ui(q: *Mpz, r: *Mpz, n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_tdiv_ui" mpz_tdiv_ui(n: *Mpz, d: Ulong) -> Ulong
+extern "__gmpz_tdiv_q_2exp" mpz_tdiv_q_2exp(q: *Mpz, n: *Mpz, b: Bitcnt)
+extern "__gmpz_tdiv_r_2exp" mpz_tdiv_r_2exp(r: *Mpz, n: *Mpz, b: Bitcnt)
+
+// `mpz_mod_ui` is `#define`d to this one.
+extern "__gmpz_mod" mpz_mod(r: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_divexact" mpz_divexact(q: *Mpz, n: *Mpz, d: *Mpz)
+extern "__gmpz_divexact_ui" mpz_divexact_ui(q: *Mpz, n: *Mpz, d: Ulong)
+extern "__gmpz_divisible_p" mpz_divisible_p(n: *Mpz, d: *Mpz) -> i32
+extern "__gmpz_divisible_ui_p" mpz_divisible_ui_p(n: *Mpz, d: Ulong) -> i32
+extern "__gmpz_divisible_2exp_p" mpz_divisible_2exp_p(n: *Mpz, b: Bitcnt) -> i32
+extern "__gmpz_congruent_p" mpz_congruent_p(n: *Mpz, c: *Mpz, d: *Mpz) -> i32
+extern "__gmpz_congruent_ui_p" mpz_congruent_ui_p(n: *Mpz, c: Ulong, d: Ulong) -> i32
+extern "__gmpz_congruent_2exp_p" mpz_congruent_2exp_p(n: *Mpz, c: *Mpz, b: Bitcnt) -> i32
+
+// ## Integers: exponentiation and roots
+
+extern "__gmpz_powm" mpz_powm(rop: *Mpz, base: *Mpz, exp: *Mpz, m: *Mpz)
+extern "__gmpz_powm_ui" mpz_powm_ui(rop: *Mpz, base: *Mpz, exp: Ulong, m: *Mpz)
+extern "__gmpz_powm_sec" mpz_powm_sec(rop: *Mpz, base: *Mpz, exp: *Mpz, m: *Mpz)
+extern "__gmpz_pow_ui" mpz_pow_ui(rop: *Mpz, base: *Mpz, exp: Ulong)
+extern "__gmpz_ui_pow_ui" mpz_ui_pow_ui(rop: *Mpz, base: Ulong, exp: Ulong)
+
+extern "__gmpz_root" mpz_root(rop: *Mpz, op: *Mpz, n: Ulong) -> i32
+extern "__gmpz_rootrem" mpz_rootrem(root: *Mpz, rem: *Mpz, op: *Mpz, n: Ulong)
+extern "__gmpz_sqrt" mpz_sqrt(rop: *Mpz, op: *Mpz)
+extern "__gmpz_sqrtrem" mpz_sqrtrem(root: *Mpz, rem: *Mpz, op: *Mpz)
+extern "__gmpz_perfect_power_p" mpz_perfect_power_p(op: *Mpz) -> i32
+extern "__gmpz_perfect_square_p" mpz_perfect_square_p(op: *Mpz) -> i32
+
+// ## Integers: number theory
+
+extern "__gmpz_probab_prime_p" mpz_probab_prime_p(n: *Mpz, reps: i32) -> i32
+extern "__gmpz_nextprime" mpz_nextprime(rop: *Mpz, op: *Mpz)
+extern "__gmpz_prevprime" mpz_prevprime(rop: *Mpz, op: *Mpz) -> i32
+extern "__gmpz_gcd" mpz_gcd(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_gcd_ui" mpz_gcd_ui(rop: *Mpz, a: *Mpz, b: Ulong) -> Ulong
+extern "__gmpz_gcdext" mpz_gcdext(g: *Mpz, s: *Mpz, t: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_lcm" mpz_lcm(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_lcm_ui" mpz_lcm_ui(rop: *Mpz, a: *Mpz, b: Ulong)
+extern "__gmpz_invert" mpz_invert(rop: *Mpz, a: *Mpz, m: *Mpz) -> i32
+
+// `mpz_kronecker` and `mpz_legendre` are `#define`d to `mpz_jacobi`.
+extern "__gmpz_jacobi" mpz_jacobi(a: *Mpz, b: *Mpz) -> i32
+extern "__gmpz_kronecker_si" mpz_kronecker_si(a: *Mpz, b: Long) -> i32
+extern "__gmpz_kronecker_ui" mpz_kronecker_ui(a: *Mpz, b: Ulong) -> i32
+extern "__gmpz_si_kronecker" mpz_si_kronecker(a: Long, b: *Mpz) -> i32
+extern "__gmpz_ui_kronecker" mpz_ui_kronecker(a: Ulong, b: *Mpz) -> i32
+
+extern "__gmpz_remove" mpz_remove(rop: *Mpz, op: *Mpz, f: *Mpz) -> Bitcnt
+extern "__gmpz_fac_ui" mpz_fac_ui(rop: *Mpz, n: Ulong)
+extern "__gmpz_2fac_ui" mpz_2fac_ui(rop: *Mpz, n: Ulong)
+extern "__gmpz_mfac_uiui" mpz_mfac_uiui(rop: *Mpz, n: Ulong, m: Ulong)
+extern "__gmpz_primorial_ui" mpz_primorial_ui(rop: *Mpz, n: Ulong)
+extern "__gmpz_bin_ui" mpz_bin_ui(rop: *Mpz, n: *Mpz, k: Ulong)
+extern "__gmpz_bin_uiui" mpz_bin_uiui(rop: *Mpz, n: Ulong, k: Ulong)
+extern "__gmpz_fib_ui" mpz_fib_ui(f: *Mpz, n: Ulong)
+extern "__gmpz_fib2_ui" mpz_fib2_ui(f: *Mpz, fsub1: *Mpz, n: Ulong)
+extern "__gmpz_lucnum_ui" mpz_lucnum_ui(ln: *Mpz, n: Ulong)
+extern "__gmpz_lucnum2_ui" mpz_lucnum2_ui(ln: *Mpz, lnsub1: *Mpz, n: Ulong)
+
+// ## Integers: comparison
+
+extern "__gmpz_cmp" mpz_cmp(a: *Mpz, b: *Mpz) -> i32
+extern "__gmpz_cmp_d" mpz_cmp_d(a: *Mpz, b: f64) -> i32
+extern "__gmpz_cmp_si" mpz_cmp_si(a: *Mpz, b: Long) -> i32
+extern "__gmpz_cmp_ui" mpz_cmp_ui(a: *Mpz, b: Ulong) -> i32
+extern "__gmpz_cmpabs" mpz_cmpabs(a: *Mpz, b: *Mpz) -> i32
+extern "__gmpz_cmpabs_d" mpz_cmpabs_d(a: *Mpz, b: f64) -> i32
+extern "__gmpz_cmpabs_ui" mpz_cmpabs_ui(a: *Mpz, b: Ulong) -> i32
+
+// ## Integers: logic and bits
+
+extern "__gmpz_and" mpz_and(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_ior" mpz_ior(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_xor" mpz_xor(rop: *Mpz, a: *Mpz, b: *Mpz)
+extern "__gmpz_com" mpz_com(rop: *Mpz, a: *Mpz)
+extern "__gmpz_popcount" mpz_popcount(op: *Mpz) -> Bitcnt
+extern "__gmpz_hamdist" mpz_hamdist(a: *Mpz, b: *Mpz) -> Bitcnt
+extern "__gmpz_scan0" mpz_scan0(op: *Mpz, start: Bitcnt) -> Bitcnt
+extern "__gmpz_scan1" mpz_scan1(op: *Mpz, start: Bitcnt) -> Bitcnt
+extern "__gmpz_setbit" mpz_setbit(rop: *Mpz, bit: Bitcnt)
+extern "__gmpz_clrbit" mpz_clrbit(rop: *Mpz, bit: Bitcnt)
+extern "__gmpz_combit" mpz_combit(rop: *Mpz, bit: Bitcnt)
+extern "__gmpz_tstbit" mpz_tstbit(op: *Mpz, bit: Bitcnt) -> i32
+
+// ## Integers: input and output
+
+extern "__gmpz_out_str" mpz_out_str(stream: *File, base: i32, op: *Mpz) -> usize
+extern "__gmpz_inp_str" mpz_inp_str(rop: *Mpz, stream: *File, base: i32) -> usize
+extern "__gmpz_out_raw" mpz_out_raw(stream: *File, op: *Mpz) -> usize
+extern "__gmpz_inp_raw" mpz_inp_raw(rop: *Mpz, stream: *File) -> usize
+
+// ## Integers: random numbers
+
+extern "__gmpz_urandomb" mpz_urandomb(rop: *Mpz, state: *RandState, n: Bitcnt)
+extern "__gmpz_urandomm" mpz_urandomm(rop: *Mpz, state: *RandState, n: *Mpz)
+extern "__gmpz_rrandomb" mpz_rrandomb(rop: *Mpz, state: *RandState, n: Bitcnt)
+
+// ## Integers: import, export, and the rest
+
+extern "__gmpz_import" mpz_import(rop: *Mpz, count: usize, order: i32, size: usize, endian: i32, nails: usize, op: *u8)
+extern "__gmpz_export" mpz_export(rop: *u8, countp: *usize, order: i32, size: usize, endian: i32, nails: usize, op: *Mpz) -> *u8
+
+extern "__gmpz_fits_ulong_p" mpz_fits_ulong_p(op: *Mpz) -> i32
+extern "__gmpz_fits_slong_p" mpz_fits_slong_p(op: *Mpz) -> i32
+extern "__gmpz_fits_uint_p" mpz_fits_uint_p(op: *Mpz) -> i32
+extern "__gmpz_fits_sint_p" mpz_fits_sint_p(op: *Mpz) -> i32
+extern "__gmpz_fits_ushort_p" mpz_fits_ushort_p(op: *Mpz) -> i32
+extern "__gmpz_fits_sshort_p" mpz_fits_sshort_p(op: *Mpz) -> i32
+extern "__gmpz_sizeinbase" mpz_sizeinbase(op: *Mpz, base: i32) -> usize
+extern "__gmpz_dump" mpz_dump(op: *Mpz)
+
+// ## Integers: limbs
+
+extern "__gmpz_size" mpz_size(op: *Mpz) -> usize
+extern "__gmpz_getlimbn" mpz_getlimbn(op: *Mpz, n: Size) -> Limb
+extern "__gmpz_limbs_read" mpz_limbs_read(x: *Mpz) -> *Limb
+extern "__gmpz_limbs_write" mpz_limbs_write(x: *Mpz, n: Size) -> *Limb
+extern "__gmpz_limbs_modify" mpz_limbs_modify(x: *Mpz, n: Size) -> *Limb
+extern "__gmpz_limbs_finish" mpz_limbs_finish(x: *Mpz, s: Size)
+extern "__gmpz_roinit_n" mpz_roinit_n(x: *Mpz, xp: *Limb, xs: Size) -> *Mpz
+
+// ## Rationals
+
+extern "__gmpq_init" mpq_init(x: *Mpq)
+extern "__gmpq_clear" mpq_clear(x: *Mpq)
+extern "__gmpq_canonicalize" mpq_canonicalize(op: *Mpq)
+
+extern "__gmpq_set" mpq_set(rop: *Mpq, op: *Mpq)
+extern "__gmpq_set_z" mpq_set_z(rop: *Mpq, op: *Mpz)
+extern "__gmpq_set_ui" mpq_set_ui(rop: *Mpq, num: Ulong, den: Ulong)
+extern "__gmpq_set_si" mpq_set_si(rop: *Mpq, num: Long, den: Ulong)
+extern "__gmpq_set_str" mpq_set_str(rop: *Mpq, s: *u8, base: i32) -> i32
+extern "__gmpq_set_d" mpq_set_d(rop: *Mpq, op: f64)
+extern "__gmpq_swap" mpq_swap(a: *Mpq, b: *Mpq)
+
+extern "__gmpq_get_d" mpq_get_d(op: *Mpq) -> f64
+extern "__gmpq_get_str" mpq_get_str(s: *u8, base: i32, op: *Mpq) -> *u8
+
+extern "__gmpq_add" mpq_add(rop: *Mpq, a: *Mpq, b: *Mpq)
+extern "__gmpq_sub" mpq_sub(rop: *Mpq, a: *Mpq, b: *Mpq)
+extern "__gmpq_mul" mpq_mul(rop: *Mpq, a: *Mpq, b: *Mpq)
+extern "__gmpq_mul_2exp" mpq_mul_2exp(rop: *Mpq, a: *Mpq, n: Bitcnt)
+extern "__gmpq_div" mpq_div(rop: *Mpq, a: *Mpq, b: *Mpq)
+extern "__gmpq_div_2exp" mpq_div_2exp(rop: *Mpq, a: *Mpq, n: Bitcnt)
+extern "__gmpq_neg" mpq_neg(rop: *Mpq, a: *Mpq)
+extern "__gmpq_abs" mpq_abs(rop: *Mpq, a: *Mpq)
+extern "__gmpq_inv" mpq_inv(rop: *Mpq, a: *Mpq)
+
+extern "__gmpq_cmp" mpq_cmp(a: *Mpq, b: *Mpq) -> i32
+extern "__gmpq_cmp_z" mpq_cmp_z(a: *Mpq, b: *Mpz) -> i32
+extern "__gmpq_cmp_ui" mpq_cmp_ui(a: *Mpq, num: Ulong, den: Ulong) -> i32
+extern "__gmpq_cmp_si" mpq_cmp_si(a: *Mpq, num: Long, den: Ulong) -> i32
+extern "__gmpq_equal" mpq_equal(a: *Mpq, b: *Mpq) -> i32
+
+extern "__gmpq_get_num" mpq_get_num(num: *Mpz, op: *Mpq)
+extern "__gmpq_get_den" mpq_get_den(den: *Mpz, op: *Mpq)
+extern "__gmpq_set_num" mpq_set_num(rop: *Mpq, num: *Mpz)
+extern "__gmpq_set_den" mpq_set_den(rop: *Mpq, den: *Mpz)
+
+extern "__gmpq_out_str" mpq_out_str(stream: *File, base: i32, op: *Mpq) -> usize
+extern "__gmpq_inp_str" mpq_inp_str(rop: *Mpq, stream: *File, base: i32) -> usize
+
+// ## Random state
+
+extern "__gmp_randinit_default" gmp_randinit_default(state: *RandState)
+extern "__gmp_randinit_mt" gmp_randinit_mt(state: *RandState)
+extern "__gmp_randinit_lc_2exp" gmp_randinit_lc_2exp(state: *RandState, a: *Mpz, c: Ulong, m2exp: Bitcnt)
+extern "__gmp_randinit_lc_2exp_size" gmp_randinit_lc_2exp_size(state: *RandState, size: Bitcnt) -> i32
+extern "__gmp_randinit_set" gmp_randinit_set(rop: *RandState, op: *RandState)
+extern "__gmp_randseed" gmp_randseed(state: *RandState, seed: *Mpz)
+extern "__gmp_randseed_ui" gmp_randseed_ui(state: *RandState, seed: Ulong)
+extern "__gmp_randclear" gmp_randclear(state: *RandState)
+extern "__gmp_urandomb_ui" gmp_urandomb_ui(state: *RandState, n: Ulong) -> Ulong
+extern "__gmp_urandomm_ui" gmp_urandomm_ui(state: *RandState, n: Ulong) -> Ulong

@@ -1,0 +1,669 @@
+module sh.sysl.gmp
+@tests
+
+import sysl.buf.Buf
+
+// What `Int` claims, against values that do not come from GMP: published constants (100!, F(100),
+// Mersenne primes, RSA-100's factors), sysl's own 256- and 512-bit integers, and identities that a
+// wrong argument order or a swapped rounding mode breaks.
+
+private big(s: string) -> Int = Int.parse(s).unwrap()
+
+private bytes_of(b: Buf[u8]) -> string = Int.from_bytes_be(b.view()).to_string_base(16)
+
+// -- Making one -----------------------------------------------------------------------------------
+
+@test("of and to_long round-trip every edge of long")
+of_long_edges()
+    for v in [0i64, 1, -1, 42, -42, 9223372036854775807, -9223372036854775808]
+        assert_eq(Int.of(v).to_long(), Some(v))
+
+    assert_eq(Int.of(-9223372036854775808i64).to_string(), "-9223372036854775808")
+    assert_eq(Int.of(18446744073709551615u64).to_string(), "18446744073709551615")
+    assert_eq(Int.of(18446744073709551615u64).to_ulong(), Some(18446744073709551615u64))
+
+@test("to_long, to_ulong and to_int refuse what does not fit")
+narrowing_refuses()
+    val past = Int.of(9223372036854775807i64) + 1
+
+    assert_eq(past.to_long(), None)
+    assert_eq(past.to_ulong(), Some(9223372036854775808u64))
+    assert_eq(Int.of(-1).to_ulong(), None)
+    assert_eq((Int.of(1) << 64).to_ulong(), None)
+    assert_eq(Int.of(2147483647).to_int(), Some(2147483647))
+    assert_eq(Int.of(2147483648i64).to_int(), None)
+    assert_eq(Int.of(-2147483648i64).to_int(), Some(-2147483648))
+    assert_eq((Int.of(1) << 64).low_ulong(), 0)
+    assert_eq(((Int.of(1) << 64) + 5).low_ulong(), 5)
+
+@test("parse reads every base and both signs")
+parse_bases()
+    assert_eq(big("12345678901234567890123"), Int.of(1234567890123i64) * Int.power(10, 10) + 4567890123i64)
+    assert_eq(big("-12345678901234567890123").to_string(), "-12345678901234567890123")
+    assert_eq(Int.parse("-ff", 16).unwrap(), Int.of(-255))
+    assert_eq(Int.parse("FF", 16).unwrap(), Int.of(255))
+    assert_eq(Int.parse("101", 2).unwrap(), Int.of(5))
+    assert_eq(Int.parse("0x1f", 0).unwrap(), Int.of(31))
+    assert_eq(Int.parse("0b11", 0).unwrap(), Int.of(3))
+    assert_eq(Int.parse("017", 0).unwrap(), Int.of(15))
+    assert_eq(Int.parse("17", 0).unwrap(), Int.of(17))
+    assert_eq(Int.parse("z", 36).unwrap(), Int.of(35))
+    assert_eq(Int.parse("Z", 36).unwrap(), Int.of(35))
+    assert_eq(Int.parse("z", 62).unwrap(), Int.of(61))
+    assert_eq(Int.parse("Z", 62).unwrap(), Int.of(35))
+    assert_eq(Int.parse(" 1 000 000 ").unwrap(), Int.of(1000000))
+
+@test("parse refuses a bad base, empty text, a stray character and an embedded NUL")
+parse_errors()
+    assert_eq(Int.parse("1", 1).err(), Some(InvalidBase))
+    assert_eq(Int.parse("1", 63).err(), Some(InvalidBase))
+    assert_eq(Int.parse("1", -10).err(), Some(InvalidBase))
+    assert_eq(Int.parse("").err(), Some(Empty))
+    assert_eq(Int.parse("   ").err(), Some(Empty))
+    assert_eq(Int.parse("12a").err(), Some(InvalidDigits))
+    assert_eq(Int.parse("2", 2).err(), Some(InvalidDigits))
+    assert_eq(Int.parse("+5").err(), Some(InvalidDigits))
+    assert_eq(Int.parse("--5").err(), Some(InvalidDigits))
+    assert_eq(Int.parse("-").err(), Some(InvalidDigits))
+    assert_eq(Int.parse("12\u{0}34").err(), Some(InvalidDigits))
+
+@test("parse reads only the slice it is given, not what follows it in memory")
+parse_reads_a_slice()
+    val s = "123456789"
+    assert_eq(Int.parse(s[0..<3]).unwrap(), Int.of(123))
+
+@test("from_real truncates toward zero and refuses NaN and infinities")
+from_real_cases()
+    assert_eq(Int.from_real(2.9), Some(Int.of(2)))
+    assert_eq(Int.from_real(-2.9), Some(Int.of(-2)))
+    assert_eq(Int.from_real(1e20), Some(big("100000000000000000000")))
+    assert_eq(Int.from_real(0.0 / 0.0), None)
+    assert_eq(Int.from_real(1.0 / 0.0), None)
+    assert_eq(Int.from_real(-1.0 / 0.0), None)
+
+@test("to_real and to_real_exp")
+to_real_cases()
+    assert_eq(Int.of(-12345).to_real(), -12345.0)
+    assert_eq((Int.of(1) << 2000).to_real_exp(), (0.5, 2001i64))
+    assert_eq(Int.of(0).to_real_exp(), (0.0, 0i64))
+    assert_eq(Int.of(-3).to_real_exp(), (-0.75, 2i64))
+
+@test("with_capacity starts at zero and grows past its room")
+with_capacity_cases()
+    val x = Int.with_capacity(1000)
+    assert(x.is_zero, "zero")
+    x.assign(Int.of(1) << 5000)
+    assert_eq(x.bit_length(), 5001)
+
+// -- Rendering ------------------------------------------------------------------------------------
+
+@test("to_string_base renders every base family")
+render_bases()
+    val x = Int.of(-255)
+    assert_eq(x.to_string_base(16), "-ff")
+    assert_eq(x.to_string_base(-16), "-FF")
+    assert_eq(x.to_string_base(2), "-11111111")
+    assert_eq(Int.of(61).to_string_base(62), "z")
+    assert_eq(Int.of(35).to_string_base(62), "Z")
+    assert_eq(Int.of(0).to_string_base(10), "0")
+    assert_eq(Int.of(0).to_string(), "0")
+
+@test("an Int renders through Display with width and precision")
+display_spec()
+    assert_eq(f"[${Int.of(-42)}%6s]", "[   -42]")
+    assert_eq(f"[${Int.of(42)}%-5s]", "[42   ]")
+    assert_eq(s"${big("123456789012345678901234567890")}", "123456789012345678901234567890")
+
+@test("Int base 1 stops the program", should_trap: "is not 2 to 62")
+render_bad_base()
+    print(Int.of(5).to_string_base(1))
+
+@test("Int base 63 stops the program", should_trap: "is not 2 to 62")
+render_base_too_big()
+    print(Int.of(5).to_string_base(63))
+
+@test("size_in_base outside 2 to 62 stops the program", should_trap: "is not 2 to 62")
+size_bad_base()
+    print(Int.of(5).size_in_base(0))
+
+@test("bytes round-trip in both orders, magnitude only")
+bytes_round_trip()
+    val x = Int.parse("0x0102030405060708090a0b0c0d0e0f10", 0).unwrap()
+    assert_eq(x.to_bytes_be().view(), [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16][..])
+    assert_eq(x.to_bytes_le()[0], 16)
+    assert_eq(Int.from_bytes_be(x.to_bytes_be().view()), x)
+    assert_eq(Int.from_bytes_le(x.to_bytes_le().view()), x)
+    assert_eq(Int.from_bytes_be([0u8, 0, 1][..]), Int.of(1))
+    assert_eq(Int.from_bytes_le([1u8, 0, 0][..]), Int.of(1))
+    assert_eq(Int.from_bytes_be([][..]), Int.of(0))
+    assert_eq(Int.of(0).to_bytes_be().len(), 0)
+    assert_eq((-x).to_bytes_be().view(), x.to_bytes_be().view())
+    assert_eq(bytes_of(Int.of(256).to_bytes_be()), "100")
+
+// -- Arithmetic against sysl's own wide integers --------------------------------------------------
+
+private u256_of(x: u256) -> Int = Int.parse(s"$x").unwrap()
+
+private i512_of(x: i512) -> Int = Int.parse(s"$x").unwrap()
+
+@test("the four operations agree with i512 on a spread of operands")
+against_i512()
+    val samples = [0i512, 1, -1, 7, -7, 1000000007, -98765432109876543210, 340282366920938463463374607431768211455, -170141183460469231731687303715884105727, 99999999999999999999999999999999999999999999999]
+
+    for a in samples
+        for b in samples
+            val x = i512_of(a)
+            val y = i512_of(b)
+
+            assert_eq(x + y, i512_of(a + b))
+            assert_eq(x - y, i512_of(a - b))
+            assert_eq(x * y, i512_of(a * b))
+
+            if b != 0
+                assert_eq(x / y, i512_of(a / b))
+                assert_eq(x % y, i512_of(a % b))
+            end if
+
+            assert_eq(x < y, a < b)
+            assert_eq(x == y, a == b)
+            assert_eq(x <= y, a <= b)
+            assert_eq(x & y, i512_of(a & b))
+            assert_eq(x | y, i512_of(a | b))
+            assert_eq(x ^ y, i512_of(a ^ b))
+        end for
+
+        assert_eq(-i512_of(a), i512_of(-a))
+        assert_eq(~i512_of(a), i512_of(~a))
+        assert_eq(i512_of(a) >> 3, i512_of(a >> 3))
+        assert_eq(i512_of(a) << 9, i512_of(a << 9))
+    end for
+end against_i512
+
+@test("a long on either side of an operator agrees with the Int form")
+mixed_long_operands()
+    val x = big("-123456789012345678901234567890")
+
+    for k in [0i64, 1, -1, 3, -3, 9223372036854775807, -9223372036854775808]
+        val y = Int.of(k)
+
+        assert_eq(x + k, x + y)
+        assert_eq(k + x, y + x)
+        assert_eq(x - k, x - y)
+        assert_eq(k - x, y - x)
+        assert_eq(x * k, x * y)
+        assert_eq(k * x, y * x)
+
+        if k != 0
+            assert_eq(x / k, x / y)
+            assert_eq(x % k, x % y)
+            assert_eq(k / x, y / x)
+            assert_eq(k % x, y % x)
+        end if
+    end for
+
+    assert_eq(Int.of(7) + 5, Int.of(12))
+    assert_eq(5 - Int.of(7), Int.of(-2))
+
+@test("compound assignment rebinds and leaves the old value alone")
+compound_rebinds()
+    var x = Int.of(10)
+    val y = x
+
+    x += 5
+    x *= Int.of(3)
+    x -= 1
+
+    assert_eq(x, Int.of(44))
+    assert_eq(y, Int.of(10))
+
+@test("division truncates, floors and ceils as named")
+division_modes()
+    val n = Int.of(-7)
+    val d = Int.of(2)
+
+    assert_eq(n / d, Int.of(-3))
+    assert_eq(n % d, Int.of(-1))
+    assert_eq(n.div_floor(d), Int.of(-4))
+    assert_eq(n.rem_floor(d), Int.of(1))
+    assert_eq(n.div_ceil(d), Int.of(-3))
+    assert_eq(n.rem_ceil(d), Int.of(-1))
+    assert_eq(Int.of(7).div_ceil(d), Int.of(4))
+    assert_eq(Int.of(7).rem_ceil(d), Int.of(-1))
+    assert_eq(n.modulo(Int.of(-2)), Int.of(1))
+    assert_eq(Int.of(7).rem_floor(Int.of(-2)), Int.of(-1))
+    assert_eq(n.div_rem(d), (Int.of(-3), Int.of(-1)))
+    assert_eq(n.div_rem_floor(d), (Int.of(-4), Int.of(1)))
+    assert_eq(Int.of(7).div_rem_ceil(d), (Int.of(4), Int.of(-1)))
+    assert_eq(Int.of(91).div_exact(Int.of(7)), Int.of(13))
+    assert_eq(n.mod_ulong(2), 1)
+    assert_eq(Int.of(-9).mod_ulong(5), 1)
+
+@test("shifts round as named")
+shift_modes()
+    val n = Int.of(-7)
+
+    assert_eq(n >> 1, Int.of(-4))
+    assert_eq(n.shr_trunc(1), Int.of(-3))
+    assert_eq(Int.of(7).shr_ceil(1), Int.of(4))
+    assert_eq(n.rem_pow2(2), Int.of(1))
+    assert_eq(n.rem_pow2_trunc(2), Int.of(-3))
+    assert_eq(Int.of(7).rem_pow2_ceil(2), Int.of(-1))
+    assert_eq(Int.of(1) << 100, Int.power(2, 100))
+
+@test("checked_div and checked_rem answer None for zero")
+checked_division()
+    assert_eq(Int.of(7).checked_div(Int.of(0)), None)
+    assert_eq(Int.of(7).checked_rem(Int.of(0)), None)
+    assert_eq(Int.of(7).checked_div(Int.of(2)), Some(Int.of(3)))
+    assert_eq(Int.of(7).checked_rem(Int.of(2)), Some(Int.of(1)))
+
+@test("Int / zero stops the program", should_trap: "Int division by zero")
+div_by_zero_int()
+    print(Int.of(1) / Int.of(0))
+
+@test("Int / 0 as a long stops the program", should_trap: "Int division by zero")
+div_by_zero_long()
+    print(Int.of(1) / 0)
+
+@test("Int % zero stops the program", should_trap: "Int division by zero")
+rem_by_zero()
+    print(Int.of(1) % Int.of(0))
+
+@test("Int % 0 as a long stops the program", should_trap: "Int division by zero")
+rem_by_zero_long()
+    print(Int.of(1) % 0)
+
+@test("div_floor by zero stops the program", should_trap: "Int division by zero")
+div_floor_by_zero()
+    print(Int.of(1).div_floor(Int.of(0)))
+
+@test("div_rem by zero stops the program", should_trap: "Int division by zero")
+div_rem_by_zero()
+    print(Int.of(1).div_rem(Int.of(0)))
+
+@test("mod_ulong by zero stops the program", should_trap: "Int division by zero")
+mod_ulong_by_zero()
+    print(Int.of(1).mod_ulong(0))
+
+@test("div_assign by zero stops the program", should_trap: "Int division by zero")
+div_assign_by_zero()
+    Int.of(1).div_assign(0)
+
+@test("set_div by zero stops the program", should_trap: "Int division by zero")
+set_div_by_zero()
+    Int.of(1).set_div(Int.of(5), Int.of(0))
+
+// -- Known values ---------------------------------------------------------------------------------
+
+@test("100! is the published value")
+factorial_100()
+    val f = Int.factorial(100)
+    assert_eq(f.to_string(), "93326215443944152681699238856266700490715968264381621468592963895217599993229915608941463976156518286253697920827223758251185210916864000000000000000000000000")
+    assert_eq(Int.factorial(0), Int.of(1))
+    assert_eq(f / Int.factorial(99), Int.of(100))
+
+@test("double factorial, multifactorial and primorial")
+other_factorials()
+    assert_eq(Int.double_factorial(9), Int.of(945))
+    assert_eq(Int.double_factorial(10), Int.of(3840))
+    assert_eq(Int.multifactorial(10, 3), Int.of(280))
+    assert_eq(Int.primorial(10), Int.of(210))
+    assert_eq(Int.primorial(13), Int.of(30030))
+
+@test("binomials, of words and of any Int")
+binomials()
+    assert_eq(Int.binomial(52, 5), Int.of(2598960))
+    assert_eq(Int.binomial(100, 50).to_string(), "100891344545564193334812497256")
+    assert_eq(Int.of(-3).choose(2), Int.of(6))
+    assert_eq(Int.of(10).choose(3), Int.of(120))
+
+@test("Fibonacci and Lucas numbers")
+fibonacci_lucas()
+    assert_eq(Int.fibonacci(100).to_string(), "354224848179261915075")
+    assert_eq(Int.fibonacci(0), Int.of(0))
+    assert_eq(Int.fibonacci2(10), (Int.of(55), Int.of(34)))
+    assert_eq(Int.lucas(10), Int.of(123))
+    assert_eq(Int.lucas(0), Int.of(2))
+    assert_eq(Int.lucas2(10), (Int.of(123), Int.of(76)))
+
+@test("2 to the 256 is u256's maximum plus one")
+two_to_256()
+    val x = Int.power(2, 256)
+    assert_eq(x - 1, u256_of(115792089237316195423570985008687907853269984665640564039457584007913129639935))
+    assert_eq(Int.of(2).pow(256), x)
+    assert_eq(x.bit_length(), 257)
+    assert_eq(Int.of(0).bit_length(), 0)
+    assert_eq(Int.of(-255).bit_length(), 8)
+    assert_eq(x.size_in_base(10), 78)
+    assert_eq(x.limb_count(), 5)
+    assert_eq(x.limb(4), 1)
+    assert_eq(x.limb(9), 0)
+
+@test("RSA-100 is the product of its published factors")
+rsa_100()
+    val p = big("37975227936943673922808872755445627854565536638199")
+    val q = big("40094690950920881030683735292761468389214899724061")
+    val n = big("1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139")
+
+    assert_eq(p * q, n)
+    assert_eq(n / p, q)
+    assert_eq(n % p, Int.of(0))
+    assert(n.is_divisible_by(q), "q divides n")
+    assert_eq(n.gcd(p * Int.of(3)), p)
+    assert_eq(p.is_probable_prime(), ProbablyPrime)
+    assert_eq(n.is_probable_prime(), Composite)
+
+@test("textbook RSA: encrypt and decrypt with p = 61, q = 53")
+rsa_textbook()
+    val n = Int.of(3233)
+    val e = Int.of(17)
+    val phi = Int.of(60) * 52
+    val d = e.invert(phi).unwrap()
+
+    assert_eq(d, Int.of(2753))
+    assert_eq(Int.of(65).pow_mod(e, n), Some(Int.of(2790)))
+    assert_eq(Int.of(2790).pow_mod(d, n), Some(Int.of(65)))
+    assert_eq(Int.of(2790).pow_mod(2753, n), Some(Int.of(65)))
+    assert_eq(Int.of(65).pow_mod_secure(e, n), Some(Int.of(2790)))
+
+@test("RSA round-trip over RSA-100's factors")
+rsa_round_trip()
+    val p = big("37975227936943673922808872755445627854565536638199")
+    val q = big("40094690950920881030683735292761468389214899724061")
+    val n = p * q
+    val phi = (p - 1) * (q - 1)
+    val e = Int.of(65537)
+    val d = e.invert(phi).unwrap()
+    val m = big("123456789012345678901234567890123456789")
+
+    assert_eq((e * d).modulo(phi), Int.of(1))
+
+    val ct = m.pow_mod(e, n).unwrap()
+
+    assert(ct != m, "encrypted")
+    assert_eq(ct.pow_mod(d, n), Some(m))
+    assert_eq(ct.pow_mod_secure(d, n), Some(m))
+
+@test("pow_mod with a negative exponent uses the inverse")
+pow_mod_negative()
+    assert_eq(Int.of(3).pow_mod(Int.of(-1), Int.of(7)), Some(Int.of(5)))
+    assert_eq(Int.of(2).pow_mod(Int.of(-1), Int.of(4)), None)
+    assert_eq(Int.of(2).pow_mod(Int.of(3), Int.of(0)), None)
+    assert_eq(Int.of(2).pow_mod(3, Int.of(0)), None)
+    assert_eq(Int.of(-2).pow_mod(Int.of(3), Int.of(5)), Some(Int.of(2)))
+
+@test("pow_mod_secure refuses an even modulus and a non-positive exponent")
+pow_mod_secure_refuses()
+    assert_eq(Int.of(3).pow_mod_secure(Int.of(5), Int.of(8)), None)
+    assert_eq(Int.of(3).pow_mod_secure(Int.of(0), Int.of(7)), None)
+    assert_eq(Int.of(3).pow_mod_secure(Int.of(-1), Int.of(7)), None)
+
+@test("Fermat's little theorem holds for the Mersenne prime 2^127 - 1")
+fermat_m127()
+    val p = Int.power(2, 127) - 1
+
+    assert_eq(p.to_string(), "170141183460469231731687303715884105727")
+    assert_eq(p.is_probable_prime(), ProbablyPrime)
+
+    for a in [2i64, 3, 65537, 1234567]
+        assert_eq(Int.of(a).pow_mod(p - 1, p), Some(Int.of(1)))
+
+@test("primality: certain below 2^64, and the classic composites")
+primality()
+    assert_eq(Int.of(2).is_probable_prime(), Prime)
+    assert_eq(Int.of(97).is_probable_prime(), Prime)
+    assert_eq(Int.of(1).is_probable_prime(), Composite)
+    assert_eq(Int.of(0).is_probable_prime(), Composite)
+    assert_eq(Int.of(561).is_probable_prime(), Composite)
+    assert_eq((Int.power(2, 67) - 1).is_probable_prime(), Composite)
+    assert_eq(Int.power(2, 67) - 1, Int.of(193707721) * Int.of(761838257287i64))
+    assert_eq((Int.power(2, 89) - 1).is_probable_prime(5), ProbablyPrime)
+
+@test("next_prime and prev_prime")
+next_prev_prime()
+    assert_eq(Int.of(100).next_prime(), Int.of(101))
+    assert_eq(Int.of(-5).next_prime(), Int.of(2))
+    assert_eq(Int.of(100).prev_prime(), Some(Int.of(97)))
+    assert_eq(Int.of(3).prev_prime(), Some(Int.of(2)))
+    assert_eq(Int.of(2).prev_prime(), None)
+    assert_eq(Int.power(10, 20).next_prime().to_string(), "100000000000000000039")
+
+@test("roots, squares and powers")
+roots()
+    assert_eq(Int.of(17).sqrt(), Some(Int.of(4)))
+    assert_eq(Int.of(17).sqrt_rem(), Some((Int.of(4), Int.of(1))))
+    assert_eq(Int.of(-1).sqrt(), None)
+    assert_eq(Int.of(-1).sqrt_rem(), None)
+    assert_eq(Int.of(-27).root(3), Some(Int.of(-3)))
+    assert_eq(Int.of(-28).root(3), Some(Int.of(-3)))
+    assert_eq(Int.of(30).root_rem(3), Some((Int.of(3), Int.of(3))))
+    assert_eq(Int.of(-16).root(2), None)
+    assert_eq(Int.of(16).root(0), None)
+    assert_eq(Int.of(16).root_rem(0), None)
+    assert_eq(Int.power(10, 40).sqrt(), Some(Int.power(10, 20)))
+    assert(Int.of(144).is_perfect_square(), "144")
+    assert(!Int.of(145).is_perfect_square(), "145")
+    assert(!Int.of(-4).is_perfect_square(), "-4")
+    assert(Int.of(243).is_perfect_power(), "3^5")
+    assert(Int.of(-8).is_perfect_power(), "(-2)^3")
+    assert(!Int.of(-4).is_perfect_power(), "-4")
+    assert(!Int.of(10).is_perfect_power(), "10")
+
+@test("gcd, gcd_ext and lcm")
+gcd_lcm()
+    val a = Int.of(240)
+    val b = Int.of(46)
+
+    assert_eq(a.gcd(b), Int.of(2))
+    assert_eq(Int.of(-12).gcd(Int.of(18)), Int.of(6))
+    assert_eq(Int.of(0).gcd(Int.of(0)), Int.of(0))
+
+    val (g, s, t) = a.gcd_ext(b)
+
+    assert_eq(g, Int.of(2))
+    assert_eq(a * s + b * t, g)
+    assert_eq((s, t), (Int.of(-9), Int.of(47)))
+    assert_eq(Int.of(4).lcm(Int.of(-6)), Int.of(12))
+    assert_eq(Int.of(0).lcm(Int.of(6)), Int.of(0))
+
+@test("invert answers None where there is no inverse")
+invert_cases()
+    assert_eq(Int.of(3).invert(Int.of(11)), Some(Int.of(4)))
+    assert_eq(Int.of(-3).invert(Int.of(11)), Some(Int.of(7)))
+    assert_eq(Int.of(6).invert(Int.of(9)), None)
+    assert_eq(Int.of(3).invert(Int.of(0)), None)
+
+@test("Jacobi, Legendre and Kronecker symbols")
+symbols()
+    assert_eq(Int.of(1001).jacobi(Int.of(9907)), Some(-1))
+    assert_eq(Int.of(19).jacobi(Int.of(45)), Some(1))
+    assert_eq(Int.of(8).jacobi(Int.of(21)), Some(-1))
+    assert_eq(Int.of(5).jacobi(Int.of(21)), Some(1))
+    assert_eq(Int.of(3).jacobi(Int.of(9)), Some(0))
+    assert_eq(Int.of(3).jacobi(Int.of(8)), None)
+    assert_eq(Int.of(3).jacobi(Int.of(-7)), None)
+    assert_eq(Int.of(2).legendre(Int.of(7)), Some(1))
+    assert_eq(Int.of(3).legendre(Int.of(7)), Some(-1))
+    assert_eq(Int.of(3).kronecker(Int.of(8)), -1)
+    assert_eq(Int.of(3).kronecker(8), -1)
+    assert_eq(Int.of(5).kronecker(Int.of(-1)), 1)
+    assert_eq(Int.of(-5).kronecker(-1), -1)
+
+@test("remove_factor counts and divides out, and refuses 0 and ±1")
+remove_factor_cases()
+    assert_eq(Int.of(360).remove_factor(Int.of(2)), Some((Int.of(45), 3u64)))
+    assert_eq(Int.of(360).remove_factor(Int.of(7)), Some((Int.of(360), 0u64)))
+    assert_eq(Int.of(360).remove_factor(Int.of(1)), None)
+    assert_eq(Int.of(360).remove_factor(Int.of(-1)), None)
+    assert_eq(Int.of(360).remove_factor(Int.of(0)), None)
+
+@test("divisibility and congruence")
+divisibility()
+    assert(Int.of(0).is_divisible_by(Int.of(0)), "0 | 0")
+    assert(!Int.of(5).is_divisible_by(Int.of(0)), "0 does not divide 5")
+    assert(Int.of(21).is_divisible_by(7), "7 | 21")
+    assert(!Int.of(22).is_divisible_by(7), "7 does not divide 22")
+    assert(Int.of(48).is_divisible_by_pow2(4), "16 | 48")
+    assert(!Int.of(48).is_divisible_by_pow2(5), "32 does not divide 48")
+    assert(Int.of(17).is_congruent(Int.of(2), Int.of(5)), "17 = 2 mod 5")
+    assert(!Int.of(17).is_congruent(Int.of(3), Int.of(5)), "17 != 3 mod 5")
+    assert(Int.of(17).is_congruent(2, 5), "17 = 2 mod 5")
+    assert(Int.of(7).is_congruent(Int.of(7), Int.of(0)), "equal mod 0")
+    assert(Int.of(17).is_congruent_pow2(Int.of(1), 3), "17 = 1 mod 8")
+    assert(!Int.of(17).is_congruent_pow2(Int.of(1), 5), "17 != 1 mod 32")
+
+// -- Comparing and hashing ------------------------------------------------------------------------
+
+@test("compare and compare_abs against Int, long and real")
+comparisons()
+    val x = Int.of(-5)
+
+    assert_eq(x.compare(Int.of(3)), -1)
+    assert_eq(x.compare(-5), 0)
+    assert_eq(x.compare(-6), 1)
+    assert_eq(x.compare(-4.5), -1)
+    assert_eq(x.compare_abs(Int.of(3)), 1)
+    assert_eq(x.compare_abs(5u64), 0)
+    assert_eq(x.compare_abs(5.5), -1)
+    assert_eq(x.sign, -1)
+    assert_eq(Int.of(0).sign, 0)
+    assert_eq(Int.of(9).sign, 1)
+    assert(x < Int.of(0) && Int.of(0) < Int.of(1) && Int.of(2) >= Int.of(2), "ordering")
+
+@test("equal values hash equally, however they were made")
+hashing()
+    val a = Int.power(2, 200) + 7
+    val b = big("1606938044258990275541962092341162602522202993782792835301383")
+
+    assert_eq(a, b)
+    assert_eq(a.hash(), b.hash())
+    assert(a.hash() != (-a).hash(), "sign is hashed")
+    assert(Int.of(1).hash() != Int.of(2).hash(), "value is hashed")
+
+@test("odd, even, zero and negative")
+predicates()
+    assert(Int.of(-3).is_odd, "-3 odd")
+    assert(Int.of(0).is_even, "0 even")
+    assert(!Int.of(0).is_odd, "0 not odd")
+    assert((Int.power(2, 100) + 1).is_odd, "2^100 + 1 odd")
+    assert(Int.of(0).is_zero, "zero")
+    assert(Int.of(-1).is_negative, "negative")
+    assert(!Int.of(0).is_negative, "zero not negative")
+
+// -- Bits -----------------------------------------------------------------------------------------
+
+@test("bit tests and the with_bit family")
+bits()
+    val x = Int.of(0b1010)
+
+    assert(x.bit(1) && !x.bit(0), "bits of 10")
+    assert(Int.of(-1).bit(1000), "-1 is all ones")
+    assert_eq(x.with_bit_set(0), Int.of(11))
+    assert_eq(x.with_bit_cleared(3), Int.of(2))
+    assert_eq(x.with_bit_flipped(1), Int.of(8))
+    assert_eq(x, Int.of(10))
+    assert_eq(Int.of(0).with_bit_set(100), Int.power(2, 100))
+
+@test("count_ones, hamming_distance and the scans")
+bit_counts()
+    assert_eq(Int.of(255).count_ones(), Some(8u64))
+    assert_eq(Int.of(-1).count_ones(), None)
+    assert_eq(Int.of(0b1010).hamming_distance(Int.of(0b0110)), Some(2u64))
+    assert_eq(Int.of(-1).hamming_distance(Int.of(1)), None)
+    assert_eq(Int.of(-1).hamming_distance(Int.of(-2)), Some(1u64))
+    assert_eq(Int.of(0b1011).find_zero(), Some(2u64))
+    assert_eq(Int.of(0b1000).find_one(), Some(3u64))
+    assert_eq(Int.of(0b1000).find_one(4), None)
+    assert_eq(Int.of(-1).find_zero(), None)
+    assert_eq(Int.of(-8).find_one(10), Some(10u64))
+    assert_eq(Int.of(40).trailing_zeros(), Some(3u64))
+    assert_eq(Int.of(0).trailing_zeros(), None)
+
+// -- In place -------------------------------------------------------------------------------------
+
+@test("the _assign family writes in place and is seen through every copy")
+assign_in_place()
+    val x = Int.of(10)
+    val alias = x
+    val other = x.copy()
+
+    x.add_assign(Int.of(5))
+    x.add_assign(-3)
+    x.sub_assign(Int.of(2))
+    x.sub_assign(-10)
+    x.mul_assign(Int.of(3))
+    x.mul_assign(-2)
+
+    assert_eq(x, Int.of(-120))
+    assert_eq(alias, Int.of(-120))
+    assert_eq(other, Int.of(10))
+
+    x.div_assign(Int.of(7))
+    assert_eq(x, Int.of(-17))
+    x.div_assign(-2)
+    assert_eq(x, Int.of(8))
+    x.rem_assign(Int.of(5))
+    assert_eq(x, Int.of(3))
+    x.neg_assign()
+    assert_eq(x, Int.of(-3))
+    x.shl_assign(4)
+    assert_eq(x, Int.of(-48))
+    x.shr_assign(5)
+    assert_eq(x, Int.of(-2))
+    x.assign(Int.of(99))
+    assert_eq(x, Int.of(99))
+    x.assign(-1)
+    assert_eq(alias, Int.of(-1))
+
+@test("add_mul, sub_mul and the set_ family")
+fused_in_place()
+    val acc = Int.of(1)
+
+    acc.add_mul(Int.of(3), Int.of(4))
+    assert_eq(acc, Int.of(13))
+    acc.add_mul(Int.of(3), -2)
+    assert_eq(acc, Int.of(7))
+    acc.sub_mul(Int.of(2), Int.of(5))
+    assert_eq(acc, Int.of(-3))
+    acc.sub_mul(Int.of(2), -5)
+    assert_eq(acc, Int.of(7))
+
+    val r = Int.of(0)
+
+    r.set_add(Int.of(2), Int.of(3))
+    assert_eq(r, Int.of(5))
+    r.set_add(Int.of(2), -3)
+    assert_eq(r, Int.of(-1))
+    r.set_sub(Int.of(2), Int.of(3))
+    assert_eq(r, Int.of(-1))
+    r.set_sub(Int.of(2), -3)
+    assert_eq(r, Int.of(5))
+    r.set_mul(Int.of(6), Int.of(7))
+    assert_eq(r, Int.of(42))
+    r.set_mul(Int.of(6), -7)
+    assert_eq(r, Int.of(-42))
+    r.set_div(Int.of(-43), Int.of(6))
+    assert_eq(r, Int.of(-7))
+    r.set_div(Int.of(43), -6)
+    assert_eq(r, Int.of(-7))
+
+@test("bits in place, and swap")
+bits_in_place()
+    val x = Int.of(0)
+    val y = Int.of(7)
+
+    x.set_bit(3)
+    x.flip_bit(0)
+    assert_eq(x, Int.of(9))
+    x.clear_bit(3)
+    assert_eq(x, Int.of(1))
+    x.swap(y)
+    assert_eq((x, y), (Int.of(7), Int.of(1)))
+
+@test("abs, negation and the one's complement")
+unary()
+    assert_eq(Int.of(-5).abs(), Int.of(5))
+    assert_eq(-Int.of(5), Int.of(-5))
+    assert_eq(~Int.of(5), Int.of(-6))
+    assert_eq(~Int.of(-1), Int.of(0))
+

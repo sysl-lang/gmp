@@ -1,0 +1,33 @@
+// GMP for sysl: integers and rationals of any size, bound to the library the machine has.
+//
+//     dependencies {
+//       gmp { git = "github.com/sysl-lang/gmp", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, and the version is the tag `v0.1.0` here. The module
+// a program imports is `sh.sysl.gmp`.
+//
+// **GMP has to be installed, and so do its headers.** It is not vendored: GMP's speed is its
+// hand-written assembly for each processor, chosen by its own `configure`, which a copy compiled as
+// plain C would give up — and the copy a CVE watch cares about is the system's.
+//
+//     brew install gmp              # macOS
+//     sudo apt install libgmp-dev   # Debian / Ubuntu
+
+package {
+  name    = "gmp"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with.
+  sysl = "0.11.10"
+}
+
+// `heap` because every `Int`, `Rat` and `Random` is a counted box whose destructor frees GMP's
+// limbs.
+requires {
+  heap = true
+
+  pkg_config {
+    gmp = "GMP — `brew install gmp` on macOS, Debian's libgmp-dev, Fedora's gmp-devel"
+  }
+}

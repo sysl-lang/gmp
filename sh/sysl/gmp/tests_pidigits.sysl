@@ -1,0 +1,123 @@
+module sh.sysl.gmp
+@tests
+
+import sysl.text.str_builder
+
+// The Benchmarks Game's pidigits — Gibbons' unbounded spigot, in the shape its GMP C entries take —
+// written against the in-place API, and once more with operators. The oracle is the first thousand
+// digits of π computed independently (Machin's formula over Python's own integers, which are not
+// GMP's), so the test cannot agree with GMP by construction.
+
+private val PI_1000 = "3141592653589793238462643383279502884197169399375105820974944592307816406286208998628034825342117067982148086513282306647093844609550582231725359408128481117450284102701938521105559644622948954930381964428810975665933446128475648233786783165271201909145648566923460348610454326648213393607260249141273724587006606315588174881520920962829254091715364367892590360011330530548820466521384146951941511609433057270365759591953092186117381932611793105118548074462379962749567351885752724891227938183011949129833673362440656643086021394946395224737190702179860943702770539217176293176752384674818467669405132000568127145263560827785771342757789609173637178721468440901224953430146549585371050792279689258923542019956112129021960864034418159813629774771309960518707211349999998372978049951059731732816096318595024459455346908302642522308253344685035261931188171010003137838752886587533208381420617177669147303598253490428755468731159562863882353787593751957781857780532171226806613001927876611195909216420198"
+
+struct Spigot
+    acc: Int
+    den: Int
+    num: Int
+    tmp: Int
+
+    // (num·nth + acc) / den, truncated.
+    extract(self, nth: long) -> ulong
+        self.tmp.set_mul(self.num, nth)
+        self.tmp.add_assign(self.acc)
+        self.tmp.div_assign(self.den)
+        self.tmp.low_ulong()
+    end extract
+
+    eliminate(self, d: ulong)
+        self.acc.sub_mul(self.den, long(d))
+        self.acc.mul_assign(10)
+        self.num.mul_assign(10)
+    end eliminate
+
+    next_term(self, k: long)
+        val k2 = k * 2 + 1
+        self.acc.add_mul(self.num, 2)
+        self.acc.mul_assign(k2)
+        self.den.mul_assign(k2)
+        self.num.mul_assign(k)
+    end next_term
+end Spigot
+
+private pi_digits(n: int) -> string
+    val s = Spigot(Int.of(0), Int.of(1), Int.of(1), Int.of(0))
+    var out = str_builder()
+    var i = 0
+    var k: long = 0
+
+    while i < n
+        k += 1
+        s.next_term(k)
+
+        if s.num > s.acc then continue
+
+        val d = s.extract(3)
+
+        if d != s.extract(4) then continue
+
+        out.push_uint(d)
+        i += 1
+        s.eliminate(d)
+    end while
+
+    out.finish()
+end pi_digits
+
+// The same spigot with nothing but operators, each building a fresh `Int`.
+private pi_digits_by_operators(n: int) -> string
+    var acc = Int.of(0)
+    var den = Int.of(1)
+    var num = Int.of(1)
+    var out = str_builder()
+    var i = 0
+    var k: long = 0
+
+    while i < n
+        k += 1
+
+        val k2 = k * 2 + 1
+
+        acc = (acc + num * 2) * k2
+        den = den * k2
+        num = num * k
+
+        if num > acc then continue
+
+        val d = (num * 3 + acc) / den
+
+        if d != (num * 4 + acc) / den then continue
+
+        val digit = d.to_long().unwrap()
+
+        out.push_int(digit)
+        i += 1
+        acc = (acc - den * digit) * 10
+        num = num * 10
+    end while
+
+    out.finish()
+end pi_digits_by_operators
+
+@test("the pidigits spigot gives the first 1,000 digits of pi")
+pidigits_1000()
+    assert_eq(pi_digits(1000), PI_1000)
+
+@test("the spigot written with operators gives the same digits")
+pidigits_operators()
+    assert_eq(pi_digits_by_operators(300), PI_1000[0..<300])
+
+@test("the Benchmarks Game's output lines: ten digits, a tab, and the count")
+pidigits_lines()
+    val digits = pi_digits(27)
+    var out = str_builder()
+    var i: usize = 0
+
+    while i < digits.len
+        val end_at = if i + 10 < digits.len then i + 10 else digits.len
+        out.push(digits[i..<end_at])
+        for _ in 0..<(10 - (end_at - i)) do out.push(" ")
+        out.push(s"\t:${end_at}\n")
+        i = end_at
+    end while
+
+    assert_eq(out.finish(),"3141592653\t:10\n5897932384\t:20\n6264338   \t:27\n")

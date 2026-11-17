@@ -1,0 +1,21 @@
+// GMP for sysl: `Int`, an integer of any size; `Rat`, an exact rational; and `Random`, for drawing
+// either. `int.sysl`, `rat.sysl` and `random.sysl` hold the three; this file holds what describes the
+// library itself.
+//
+// `sh.sysl.gmp.c` is GMP's C interface as the header declares it, for a program that needs a
+// function the types here do not wrap; `Int.as_mpz` and `Rat.as_mpq` hand it the C value.
+
+module sh.sysl.gmp
+
+import sh.sysl.gmp.c
+import sysl.text.from_utf8_unchecked
+
+// The GMP this was linked against, as it reports itself (`6.3.0`).
+version() -> string
+    var n: usize = 0
+    while c.version[n] != 0 do n += 1
+    from_utf8_unchecked(c.version[0..<n])
+end version
+
+// The bits in one limb, the unit GMP stores digits in (64 on every 64-bit machine).
+limb_bits() -> int = int(c.bits_per_limb)
